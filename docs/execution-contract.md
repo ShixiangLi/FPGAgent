@@ -6,7 +6,9 @@
 
 `fpga_agent/contract.py` 集中定义任务文件路径、需求格式、任务清单、工程元数据、板卡绑定、VIO采样及Python脚本接口。规划阶段和工程组装复用这些规则；`development.py` 保留原导入接口，不再维护另一套路径规则。
 
-`contract.describe()` 将相同规则及工具职责提供给模型。XDC/Tcl、VIO注入、VCD和正常仿真结束由框架负责。用户工程交付RTL、testbench、Python、数据和README。
+`contract.describe(board)` 将相同规则及工具职责提供给模型，包含当前板卡资源名枚举、bindings字符串映射示例和VIO探针对象结构。XDC/Tcl、VIO注入、VCD和正常仿真结束由框架负责。用户工程交付RTL、testbench、Python、数据和README。
+
+接口错误保留框架来源标签；类型错误提供字段路径、期望类型、实际类型和实际值，不转换成板卡知识判断。原始工具诊断仍按真实日志返回。板卡资料的自主查询、引用和确认安装见[资料搜索与板卡准备](board-research.md)。
 
 ## 确认前的反馈循环
 
@@ -52,3 +54,7 @@ VIO可声明debug.min_duration_ms。例如至少采样10秒，可设置sample_ms
 回归覆盖：错误计划在确认前修正、多项接口错误反馈、冻结需求不被修改、修正上限、声明和实际采样跨度、真实Python读取当前CSV、非零退出、缺少产物、下载失败不执行分析、远程验收来源。
 
 另运行了真实XSIM→VCD→Python波形链路。硬件分析回归使用明确构造的CSV，不是实际板卡采样。本次没有调用DeepSeek执行完整开发，也未操作板卡。
+
+## VIO 总线读取
+
+Vivado 可能将一个输入端口按综合后的网络名拆成多个 `hw_probe`。下载脚本通过 `templates/vio.tcl` 按 `PROBE_PORT_BITS`（端口内起始位）和 `WIDTH` 还原逻辑值，不依赖综合后的网络名称。采样前检查每个声明端口的完整位覆盖、无重叠且无越界；每次读取检查十六进制值与片段位宽。CSV 列名及总位宽仍来自已确认的 `debug.probes`。缺失或异常映射会返回包含端口、片段和实际位信息的错误，不能作为硬件验证通过。

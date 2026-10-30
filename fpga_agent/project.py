@@ -9,6 +9,8 @@ from .contract import file_path, project_fields, script_fields, validate_spec
 
 
 def board_profile(config: dict) -> dict:
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", config["board"]):
+        raise ValueError("Invalid board profile id")
     path = Path(config["root"]) / "boards" / (config["board"] + ".json")
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -115,7 +117,7 @@ endmodule
         index = module.end() - len("endmodule")
         top.write_text(text[:index] + insertion + text[index:], encoding="utf-8")
     scripts = {"simulation": "generic_sim.tcl", "build": "generic_build.tcl", "probe": "probe.tcl", "program": "generic_program.tcl"}
-    for name in scripts.values():
+    for name in (*scripts.values(), "vio.tcl"):
         shutil.copy2(Path(config["root"]) / "templates" / name, root / "scripts" / name)
     # Small Tcl data file written by the controller, never arbitrary LLM Tcl.
     lines = [f"set agent_top {{{design['top']}}}", f"set agent_part {{{board['part']}}}",

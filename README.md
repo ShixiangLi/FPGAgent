@@ -2,7 +2,7 @@
 
 输入自然语言需求，智能体先更新需求文档与方案，再生成完整多文件工程，执行自检仿真、Python波形绘图、按需综合实现与上板。执行目标由当前需求和模型计划决定，不再由启动开关固定。
 
-当前使用顺序增量开发：先拆分小任务，每轮交付1至3个文件，保存检查点后继续下一项；集成失败时只返回修改文件。支持仿真前Python生成系数等数据。详见[增量开发与恢复](docs/incremental-development.md)。
+当前使用顺序增量开发：先拆分小任务，任务内通过检查点和片段修改分轮构建工作草稿，最终交付1至3个文件后继续下一项；集成失败时只修改相关文件。支持仿真前Python生成系数等数据。详见[增量开发与恢复](docs/incremental-development.md)。
 
 系统提示词及通用模型指令集中维护在 [`fpga_agent/prompts/catalog.py`](fpga_agent/prompts/catalog.py)，职责与维护方式见[提示词说明](fpga_agent/prompts/README.md)。核心模块保留流程和动态数据组装。
 
@@ -10,7 +10,7 @@
 
 开发前有两个用户确认点：先确认需求分析，再确认设计与测试方案。输入 `y` 或 `确认` 继续，输入修改意见让模型重新整理，输入 `/pause` 暂停；空行不会提交，会继续等待。需求未确认不生成方案，方案未确认不生成代码。确认记录绑定内容摘要，修改后受影响的确认需重新进行。当前测试方案保存在任务目录的 `test_plan.md`。
 
-模型为 `deepseek-v4-pro`，开启 `thinking`，默认 `reasoning_effort=high`。Python 3.10+，绘图使用 matplotlib；安装依赖：` .\.venv\Scripts\python.exe -m pip install -r requirements.txt `。
+模型按 `config.json` 选择，支持 `deepseek-v4-pro` 和 `deepseek-flash`，开启 `thinking`，默认 `reasoning_effort=high`。Python 3.10+，绘图使用 matplotlib，PDF读取使用 PyMuPDF；安装依赖：` .\.venv\Scripts\python.exe -m pip install -r requirements.txt `。
 
 ## 开始一个新任务
 
@@ -25,7 +25,7 @@
 .\.venv\Scripts\python.exe main.py run --request "实现PWM调光，使用板载LED1，100Hz，25%占空比，PL_KEY复位，生成完整工程和自检测试"
 ```
 
-完整工程比单文件需要更多生成时间。初次试用可在 `run` 后加 `--effort low`，仍然开启思考模式；省略则保持配置中的 `high`。若响应因 `max_tokens` 耗尽而截断，框架不会应用部分代码，可降低思考强度或按需增大输出预算及超时。
+完整工程比单文件需要更多生成时间。`--effort` 始终由用户选择，省略则使用配置中的 `high`；框架不自动降低思考强度或增加输出预算。开发循环通过小步暂存、累计摘要和按需compact续接；截断后先保存不含代码的拆解检查点，下一轮以选定的小步骤为目标。读取文件不会清除恢复状态。截断内容不应用，连续截断或无进展会保存为 `development_paused`，可用 `--resume <任务编号> --continue` 继续原任务。
 
 自然语言明确要求下载或上板验证时，计划设置 `program=true`，审查通过后自动下载。不要求下载时不自动安排下载；`--program` 只是初始意图提示，后续用户回答可以覆盖：
 
@@ -78,7 +78,31 @@
 
 现场异常用 `--failed`。`completed` 才表示已记录现场验收。退出码0也可能只是 `simulation_verified`、`ready_to_program` 或 `awaiting_acceptance`；2为等待输入，1失败，130中断。
 
+`development_paused` 表示开发小步达到本批执行上限，退出码为2；与等待澄清不同，`--continue` 直接恢复工作检查点，不先要求回答一个新问题。暂停原因及下一步见 `working.md`。
+
 `verify` 对当前源码重新仿真、构建和审查，不要求模型重新生成代码，也不自动修复。若某轮模型候选因框架兼容性检查失败，可用 `verify <任务编号> --candidate <任务内candidate文件相对路径>` 重新验证该快照，不能改变任务规格。
+
+## 搜索与解读参考资料
+
+需求分析与方案规划可以调用通用只读资料工具：搜索网页、下载来源、检索PDF/文本、按页阅读，以及将PDF图表页面交给视觉模型解读。资料可包括板卡/器件手册、协议规范、工具文档、论文、算法说明、参考代码和测试数据。工具返回真实结果或异常类型与消息。
+
+将资料放到 `references/`（可分子目录），或按任务提供文件/URL；仍会发现 `boards/` 中的PDF：
+
+```powershell
+.\.venv\Scripts\python.exe main.py run --target sim --source "D:\references\protocol.pdf" --source "D:\references\vectors.csv" --request "根据协议资料实现接收器，自检仿真并绘制波形；版本或时序不清楚先提问，不上板"
+```
+
+研究笔记写入任务的 `research.md`，供后续设计和代码生成读取；来源快照、分页文本及原始工具结果另行保存。完整说明见[通用资料研究](docs/research.md)。
+
+新板卡或补充资源先运行资料准备任务，智能体自行选择查询步骤，给出附原文引用的候选配置：
+
+```powershell
+.\.venv\Scripts\python.exe main.py board-research --board axu15egb --request "读取AXU15EGB手册，核对完整器件型号、差分时钟、PL_KEY及两个PL LED，标注来源页码；型号或版本冲突先提问"
+```
+
+终端支持提问、修改与确认。候选配置只有在用户明确确认后才安装到 `boards/<id>.json`，已有配置会在任务目录备份。新任务使用 `run --board <id>` 选择已安装配置，续接沿用原任务板卡。普通开发中的资料查询不会覆盖配置。
+
+详细命令、恢复方式、来源产物和能力边界见[资料搜索与板卡准备](docs/board-research.md)。
 
 ## 初版能力边界
 
@@ -87,7 +111,7 @@
 - PWM、计数器、按键去抖、数字状态机等可利用现有板载资源构建完整上板工程。
 - UART/SPI等核心可以直接仿真；要连接物理接口，须先在板卡配置中补充经核实的引脚、电气标准和方向。智能体会询问，不会猜引脚。
 - PS软件、VHDL、DDR/高速收发器、第三方或复杂厂商IP目前不支持。简单时钟原语由生成的RTL实例化，VIO可由框架注入。
-- 模型不能直接执行任意shell或生成Tcl，也不能修改板卡配置。框架检查文件路径及执行参数，不扫描HDL关键字或系统函数；这不是针对恶意代码的安全沙箱。
+- 模型不能直接执行任意shell或生成Tcl；板卡配置变更通过资料准备和用户确认。框架检查文件路径及执行参数，不扫描HDL关键字或系统函数；这不是针对恶意代码的安全沙箱。
 
 ## 文件结构
 
@@ -99,10 +123,17 @@ fpga_agent/
   agent.py                    DeepSeek需求理解、生成、修复、独立上下文审查
   project.py                  多文件校验、工程组装、约束和仿真驱动生成
   workflow.py                 状态、冻结规格、阶段控制、续接和报告
+  documents.py                搜索、来源快照、分页PDF读取和页面图像解读
+  research.py                 通用资料发现、工具动作、结果反馈和研究笔记
+  board_research.py           复用通用资料工具，准备并确认安装板卡配置
+references/                   协议、器件、工具等参考资料，可按主题分目录
   tools.py                    工具进程、验证结果、摘要与下载门槛
 templates/generic_*.tcl        通用仿真、构建与下载执行器
 workspace/<任务编号>/
   state.json                  需求、对话、状态、版本和结果
+  draft.json                  已最终交付的文件与任务记录
+  editing/<摘要>.json         当前任务的暂存修改、累计摘要、读取窗口和续接信息
+  working.md                  当前开发小步、下一步、暂存文件和实际反馈
   revisions/<版本>/candidate-*.json  每一轮模型工程输出与修复，续接不覆盖历史
   design_response.json         最近一次需求阶段响应
   llm_calls.jsonl              模型调用用量和思考是否返回，不保存思考原文

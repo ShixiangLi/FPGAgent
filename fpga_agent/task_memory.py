@@ -47,7 +47,8 @@ def sync(task, state):
              + json.dumps({"tasks": plan.get("development_tasks", []), "current": state.get("current_work_item"),
                            "results": state.get("work_items", {})}, ensure_ascii=False, indent=2) + "\n")
     write_json(task / "task.json", {"task_id": task.name, "status": state["status"], "plan": plan,
-               "documents": ["requirements.md", "design.md", "test_plan.md", "tasks.md", "progress.md"],
+               "documents": ["requirements.md", "design.md", "test_plan.md", "tasks.md", "progress.md"]
+                            + [name for name in ("research.md", "working.md") if (task / name).is_file()],
                "confirmations": state.get("confirmations", {}), "pending_confirmation": state.get("pending_confirmation"),
                "work_items": state.get("work_items", {}), "current_work_item": state.get("current_work_item"),
                "artifacts": [str(p.relative_to(task)) for folder in ("artifacts",)
@@ -56,4 +57,17 @@ def sync(task, state):
 
 def context(task):
     return {name: (task / name).read_text(encoding="utf-8")[:14000]
-            for name in ("requirements.md", "design.md", "test_plan.md", "progress.md") if (task / name).is_file()}
+            for name in ("requirements.md", "design.md", "test_plan.md", "progress.md", "research.md") if (task / name).is_file()}
+
+
+def work_context(task):
+    """Keep confirmed inputs exact; omit the full task list and old progress logs."""
+    path = task / "state.json"
+    if not path.is_file():
+        return context(task)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    plan = state.get("plan", {})
+    return {"confirmed_requirements": state.get("requirements_analysis") or {"spec": state.get("spec")},
+            "approved_design": plan.get("design", ""), "approved_test_plan": plan.get("test_plan", ""),
+            "project_contract": plan.get("project", {}),
+            "research.md": (task / "research.md").read_text(encoding="utf-8")[:14000] if (task / "research.md").is_file() else ""}

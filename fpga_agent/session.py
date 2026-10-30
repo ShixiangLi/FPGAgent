@@ -12,17 +12,25 @@ from .interaction import read_reply
 from . import contract
 from .project import board_profile
 
-from .prompts.catalog import ANALYST, PLANNER, PLAN_CONTRACT, PLAN_REPAIR
+from .prompts.catalog import ANALYST, PLANNER, PLAN_CONTRACT, PLAN_REPAIR, RESEARCH_ACCESS
 
 
 def _model(task, state, config, request, system, confirmed=None, proposed=None, errors=None):
+    from .research import READ_ACTIONS, tool_context, read_tool
     payload = {"current_documents": memory.context(task), "latest_user_input": request,
-               "confirmed_requirements": confirmed, "execution_contract": contract.describe(),
+               "confirmed_requirements": confirmed, "execution_contract": contract.describe(board_profile(config)),
                "proposed_plan": proposed, "validation_errors": errors,
                "defaults": {"target": config.get("target"), "program": config.get("program_default", False)}}
-    return DeepSeekClient(config).complete([
-        {"role": "system", "content": system + PLAN_CONTRACT + project_context(config)},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], task / "llm_calls.jsonl")
+    for turn in range(8):
+        payload["research"] = tool_context(task, config)
+        payload["last_research_round"] = turn == 7
+        response = DeepSeekClient(config).complete([
+            {"role": "system", "content": system + PLAN_CONTRACT + RESEARCH_ACCESS + project_context(config)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], task / "llm_calls.jsonl")
+        if response.get("action") not in READ_ACTIONS:
+            return response
+        read_tool(task, config, response)
+    return {"action": "clarify", "message": "本轮资料查询达到上限，证据已保存。请补充资料或确认继续查询。"}
 
 
 def _answer(task, state, ask):
@@ -36,13 +44,13 @@ def _executable_plan(task, state, config, request, analysis, plan):
     """Repair interface errors before asking the user to approve a plan."""
     attempts = task / "planning"
     attempts.mkdir(exist_ok=True)
-    tools.write_json(task / "execution_contract.json", contract.describe())
+    tools.write_json(task / "execution_contract.json", contract.describe(board_profile(config)))
     for attempt in range(config.get("max_plan_repairs", 3) + 1):
         if plan is None:
             plan = _model(task, state, config, request, PLANNER, analysis)
         if plan.get("action") == "clarify":
             return plan
-        errors = contract.plan_errors(plan, analysis, board_profile(config))
+        errors = contract.plan_issues(plan, analysis, board_profile(config))
         tools.write_json(attempts / (uuid.uuid4().hex + ".json"), {"plan": plan, "errors": errors})
         state["plan_contract_errors"] = errors
         if not errors:
@@ -50,21 +58,23 @@ def _executable_plan(task, state, config, request, analysis, plan):
             return plan
         state["status"] = "repairing_plan"
         workflow.save(task, state)
-        memory.event(task, "计划接口反馈", "\n".join(errors))
+        memory.event(task, "计划接口反馈", json.dumps(errors, ensure_ascii=False, indent=2))
         if attempt == config.get("max_plan_repairs", 3):
-            raise ValueError("Plan contract repair limit: " + "; ".join(errors))
+            raise ValueError("Plan contract repair limit: " + json.dumps(errors, ensure_ascii=False))
         plan = _model(task, state, config, request, PLANNER + PLAN_REPAIR, analysis, plan, errors)
 
 
-def run(request, config, ask=None, task_id=None, continue_existing=False):
-    checks = workflow.environment_checks(config)
-    if not all(checks[k] for k in ("vivado", "board_profile", "templates")):
-        raise ValueError("Local environment is incomplete; run doctor.")
+def run(request, config, ask=None, task_id=None, continue_existing=False, sources=()):
     task = workflow.task_path(config, task_id) if task_id else Path(config["workspace_path"]) / (
         datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
     task.mkdir(exist_ok=True)
     state = json.loads((task / "state.json").read_text(encoding="utf-8")) if task_id else {
         "task_id": task.name, "request": request, "status": "planning", "results": [], "conversation": [], "project_format": 2}
+    # Board selection belongs to the task and survives a CLI resume.
+    config = {**config, "board": state.setdefault("board_id", config["board"])}
+    checks = workflow.environment_checks(config)
+    if not all(checks[k] for k in ("vivado", "board_profile", "templates")):
+        raise ValueError("Local environment is incomplete; run doctor.")
     if continue_existing and not task_id:
         raise ValueError("--continue requires an existing task.")
     if continue_existing and state["status"] in {"completed", "awaiting_acceptance"}:
@@ -79,6 +89,7 @@ def run(request, config, ask=None, task_id=None, continue_existing=False):
         raise ValueError("No saved requirements; resume with --request to plan again.")
     with tools.lock(task / "active.lock"):
         try:
+            state["research_sources"] = list(dict.fromkeys(state.get("research_sources", []) + [str(s) for s in sources]))
             if resuming_question:
                 request = _answer(task, state, ask)
                 if not request:

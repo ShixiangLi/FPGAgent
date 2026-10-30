@@ -24,8 +24,8 @@ def load_config(path: Path) -> dict:
     # Optional historical example; new development never reads these source files.
     config["project_dir"] = str((root / config.get("project_dir", "projects/led")).resolve())
     config["workspace_path"] = str((root / config["workspace_dir"]).resolve())
-    if config["board"] != "axu15egb":
-        raise ValueError("第一版仅支持 AXU15EGB。")
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", config["board"]):
+        raise ValueError("board必须是boards目录中的小写配置id。")
     Path(config["workspace_path"]).mkdir(parents=True, exist_ok=True)
     return config
 
@@ -42,7 +42,7 @@ def task_path(config: dict, task_id: str) -> Path:
 def environment_checks(config: dict) -> dict:
     profile = Path(config["root"]) / "boards" / (config["board"] + ".json")
     missing_templates = [str(Path(config["root"]) / "templates" / p)
-                         for p in config["scripts"].values()
+                         for p in (*config["scripts"].values(), "vio.tcl")
                          if not (Path(config["root"]) / "templates" / p).is_file()]
     return {"vivado": Path(config["vivado_path"]).is_file(),
             "board_profile": profile.is_file(), "board_profile_path": str(profile),
@@ -63,7 +63,8 @@ def save(task: Path, state: dict) -> None:
         complete_calls = [c for c in calls if c.get("finish_reason") == "stop"]
         thought_calls = sum(bool(call.get("reasoning_received")) for call in calls)
         efforts = sorted({c.get("reasoning_effort", "unknown") for c in calls})
-        model_description = (f"deepseek-v4-pro，thinking enabled，effort {','.join(efforts)}。"
+        models = sorted({c.get("model") or "unknown" for c in calls})
+        model_description = (f"{','.join(models)}，thinking enabled，effort {','.join(efforts)}。"
                              f"记录调用 {len(calls)} 次，完整返回 {len(complete_calls)} 次，{thought_calls} 次包含思考内容。")
     report = [f"# FPGA 任务 {task.name}", f"\n状态：{state['status']}",
               f"\n需求：{state.get('request', '')}",
@@ -199,6 +200,8 @@ def develop(task: Path, state: dict, config: dict, response: dict) -> dict:
             if response.get("action") == "clarify":
                 state.update(status="waiting_for_user", question=state["error"])
                 state["conversation"].append({"role": "assistant", "content": json.dumps(response, ensure_ascii=False)})
+            elif response.get("action") == "pause":
+                state.update(status="development_paused", question=None)
             save(task, state)
             return state
         state.pop("error", None)

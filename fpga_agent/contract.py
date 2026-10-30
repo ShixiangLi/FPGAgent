@@ -1,4 +1,5 @@
 """One execution contract shared by planning, file delivery and project assembly."""
+import json
 import re
 from pathlib import PurePosixPath
 
@@ -7,6 +8,18 @@ PORT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]+\])?$")
 FILE_TYPES = {"rtl": (".sv", ".v"), "sim": (".sv", ".v"), "scripts": (".py",),
               "data": (".hex", ".mem", ".txt", ".json", ".csv")}
 SAMPLE_LIMITS = (("sample_ms", 100, 10, 1000), ("samples", 30, 10, 300))
+
+
+def issue(field, expected, actual, code="invalid_value"):
+    types = {dict: "object", list: "array", str: "string", int: "integer", bool: "boolean", type(None): "null"}
+    return {"source": "framework_contract", "code": code, "field": field, "expected": expected,
+            "actual_type": types.get(type(actual), type(actual).__name__), "actual_value": actual}
+
+
+class ContractError(ValueError):
+    def __init__(self, issues):
+        self.issues = issues
+        super().__init__(json.dumps(issues, ensure_ascii=False))
 
 
 def validate_spec(spec):
@@ -79,11 +92,22 @@ def project_fields(project, board, target):
     timeout = project.get("simulation_timeout_ns", 100000)
     if type(timeout) is not int or not 100 <= timeout <= 100000000:
         raise ValueError("simulation_timeout_ns范围为100至100000000。")
-    bindings = project.get("bindings") or {}
-    if not isinstance(bindings, dict) or any(not PORT.fullmatch(p) for p in bindings):
-        raise ValueError("bindings必须是顶层端口名到板卡资源名的映射。")
-    if any(not isinstance(r, str) or r not in board["resources"] for r in bindings.values()):
-        raise ValueError("使用了未核实的板卡资源；请询问用户并补充boards配置，不能猜引脚。")
+    bindings = project.get("bindings")
+    if bindings is None:
+        bindings = {}
+    if not isinstance(bindings, dict):
+        raise ContractError([issue("project.bindings", "object: top port -> board resource name string", bindings, "invalid_type")])
+    issues = []
+    for port, resource in bindings.items():
+        field = f"project.bindings.{port}"
+        if not isinstance(port, str) or not PORT.fullmatch(port):
+            issues.append(issue(field, "top-level port identifier", port, "invalid_port"))
+        if not isinstance(resource, str):
+            issues.append(issue(field, {"type": "string", "enum": list(board["resources"])}, resource, "invalid_type"))
+        elif resource not in board["resources"]:
+            issues.append(issue(field, {"enum": list(board["resources"])}, resource, "unknown_resource"))
+    if issues:
+        raise ContractError(issues)
     if len(set(bindings.values())) != len(bindings):
         raise ValueError("多个端口不能占用同一个板卡资源。")
     for resource in bindings.values():
@@ -100,9 +124,9 @@ def project_fields(project, board, target):
         if not isinstance(probes, list) or not 1 <= len(probes) <= 16:
             raise ValueError("debug.probes需要1至16个信号。")
         names = set()
-        for probe in probes:
+        for index, probe in enumerate(probes):
             if not isinstance(probe, dict):
-                raise ValueError("每个debug探针必须是对象。")
+                raise ContractError([issue(f"project.debug.probes[{index}]", {"type": "object", "required": ["name", "width"]}, probe, "invalid_type")])
             name, width = probe.get("name"), probe.get("width")
             if not isinstance(name, str) or not IDENT.fullmatch(name) or name in names or type(width) is not int or not 1 <= width <= 32:
                 raise ValueError("debug探针必须为不重复的信号名，宽度1至32。")
@@ -143,28 +167,53 @@ def script_fields(project, files):
     return result
 
 
-def describe():
+def describe(board=None):
     """Machine-readable capabilities derived from the same execution rules."""
     return {"file_types": FILE_TYPES, "extra_file": "README.md", "max_tasks": 24,
             "max_files_per_task": 3, "max_project_files": 32,
             "framework_owned": ["XDC/Tcl generation from bindings", "VIO injection from debug",
                                 "VCD export at build/sim/waveform.vcd", "normal simulation finish after testbench.done"],
             "project": {"top": "module identifier, not file path", "testbench": "module identifier, not file path",
-                "bindings": "top port to verified board resource; build requires board clock",
-                "debug": "null or {clock,probes,sample_ms,samples,min_duration_ms}; required for VIO sampling",
+                "bindings": {"type": "object", "additionalProperties": {"type": "string", "enum": list((board or {}).get("resources", {}))},
+                    "example": {name: name for name in list((board or {}).get("resources", {}))[:6]},
+                    "rule": "Values are resource NAME strings, never pin/standard/direction objects; build requires board clock"},
+                "debug": {"type": ["object", "null"], "required": ["clock", "probes"],
+                    "clock": "top-level internal clock identifier",
+                    "probes": {"type": "array", "minItems": 1, "maxItems": 16,
+                        "items": {"type": "object", "required": ["name", "width"],
+                            "name": "unique top-level internal signal identifier", "width": "integer 1..32",
+                            "allowed_values": "optional array of integers fitting width", "min_changes": "optional integer 0..100"}},
+                    "sampling": {k: {"default": d, "min": lo, "max": hi} for k, d, lo, hi in SAMPLE_LIMITS},
+                    "min_duration_ms": "integer 0..60000; (samples-1)*sample_ms must cover it",
+                    "example": {"clock": "clk", "probes": [{"name": "led_state", "width": 2}],
+                                "samples": 30, "sample_ms": 100}},
                 "analysis_script": "optional scripts/*.py: --input real VCD --output artifact directory",
                 "hardware_analysis": "optional {script:scripts/*.py,outputs:[artifact filenames]}; --input real VIO CSV --output artifact directory"},
             "hardware_analysis_requires": ["program=true", "debug configured", "successful current programming and sampling"],
             "vio_sampling_limits": {k: {"default": d, "min": lo, "max": hi} for k, d, lo, hi in SAMPLE_LIMITS},
             "hardware_csv": "elapsed_ms decimal timestamp; each probe column contains hexadecimal values",
+            "jtag_device_family": "xczu15* (current probe/program scripts); other profiles can prepare/simulate/build, but not auto-program",
             "unsupported": ["model-generated XDC/Tcl or arbitrary shell commands", "automatic physical LED light verification"]}
 
 
+def plan_issues(plan, confirmed, board):
+    """Structured interface facts for the model; tool diagnostics are not rewritten."""
+    try:
+        return _plan_errors(plan, confirmed, board)
+    except (TypeError, KeyError) as exc:
+        return [{"source": "framework_contract", "field": "plan", "code": "invalid_structure", "message": str(exc)}]
+
+
 def plan_errors(plan, confirmed, board):
+    """Readable compatibility view for existing callers."""
+    return [entry.get("message") or json.dumps(entry, ensure_ascii=False) for entry in plan_issues(plan, confirmed, board)]
+
+
+def _plan_errors(plan, confirmed, board):
     """Check execution interfaces only, never infer HDL or algorithm correctness."""
     errors = []
     if not isinstance(plan, dict):
-        return ["Plan must be an object"]
+        return [issue("plan", "object", plan, "invalid_type")]
     for key in ("spec", "target", "program", "visualization"):
         if plan.get(key) != confirmed.get(key):
             errors.append(f"Plan changed confirmed requirements: {key}")
@@ -197,7 +246,7 @@ def plan_errors(plan, confirmed, board):
         errors.append("Project filenames conflict ignoring case")
     project = plan.get("project")
     if not isinstance(project, dict):
-        return errors + ["project must be an object"]
+        return [dict(source="framework_contract", field="plan", code="invalid_value", message=e) for e in errors] + [issue("project", "object", project, "invalid_type")]
     checked = dict(project)
     for key in ("top", "testbench"):
         value = project.get(key)
@@ -206,6 +255,8 @@ def plan_errors(plan, confirmed, board):
             checked[key] = "placeholder"
     try:
         project_fields(checked, board, confirmed["target"])
+    except ContractError as exc:
+        errors.extend(exc.issues)
     except (ValueError, TypeError, KeyError) as exc:
         errors.append(str(exc))
     try:
@@ -214,4 +265,7 @@ def plan_errors(plan, confirmed, board):
         errors.append(str(exc))
     if project.get("hardware_analysis") and (not plan.get("program") or not project.get("debug")):
         errors.append("hardware_analysis requires program=true and debug/VIO probes")
-    return list(dict.fromkeys(errors))
+    if plan.get("program") and not board.get("part", "").startswith("xczu15"):
+        errors.append(issue("program", "current JTAG scripts support xczu15*; adapt download tools before other devices", board.get("part"), "unsupported_device"))
+    entries = [e if isinstance(e, dict) else {"source": "framework_contract", "code": "invalid_value", "field": "plan", "message": e} for e in errors]
+    return list({json.dumps(e, sort_keys=True, ensure_ascii=False): e for e in entries}.values())

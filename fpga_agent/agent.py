@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .prompts.catalog import (
     SYSTEM, REVIEWER, DIAGNOSTIC, LEGACY_REPAIR_INSTRUCTION,
-    RESPONSE_BUDGET_RETRY, REPORT_EXCERPT_NOTE, PROJECT_CONTEXT_PREFIX,
+    REPORT_EXCERPT_NOTE, PROJECT_CONTEXT_PREFIX,
     json_repair_instruction,
 )
 
@@ -29,14 +29,21 @@ def load_env(path: Path) -> None:
             os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+class GenerationTruncated(RuntimeError):
+    """The caller owns task recovery; transport never applies or retries partial output."""
+    def __init__(self, details):
+        self.details = details
+        super().__init__("DeepSeek生成截断，未应用残缺响应：" + json.dumps(details, ensure_ascii=False))
+
+
 class DeepSeekClient:
     def __init__(self, config: dict):
         self.config = config["llm"]
         self.key = os.environ.get("DEEPSEEK_API_KEY", "")
         if not self.key or self.key.startswith("replace-with"):
             raise ValueError("请在 .env 或环境变量中配置 DEEPSEEK_API_KEY。")
-        if self.config["model"] != "deepseek-v4-pro" or not self.config["thinking"]:
-            raise ValueError("本项目要求 deepseek-v4-pro 且开启 thinking。")
+        if self.config["model"] not in {"deepseek-v4-pro", "deepseek-flash"} or not self.config["thinking"]:
+            raise ValueError("支持 deepseek-v4-pro 或 deepseek-flash，且需开启 thinking。")
         if self.config.get("proxy_mode", "system") not in {"system", "direct"}:
             raise ValueError("llm.proxy_mode必须为system或direct。")
 
@@ -61,7 +68,7 @@ class DeepSeekClient:
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key},
         )
-        print(f"[LLM] deepseek-v4-pro thinking=enabled effort={self.config['reasoning_effort']} "
+        print(f"[LLM] {self.config['model']} thinking=enabled effort={self.config['reasoning_effort']} max_tokens={self.config['max_tokens']} "
               f"network={self.config.get('proxy_mode', 'system')}，等待响应……", flush=True)
         for attempt in range(3):
             try:
@@ -98,27 +105,29 @@ class DeepSeekClient:
             detail = detail.replace(self.key, "[REDACTED]")[:500]
             raise RuntimeError("DeepSeek未返回有效choices，可能为服务超时或异常响应：" + detail)
         choice, message = choices[0], choices[0]["message"]
-        if audit_path:
-            audit = {
-                "model": data.get("model"), "thinking": True,
-                "reasoning_effort": self.config["reasoning_effort"],
-                "reasoning_received": bool(message.get("reasoning_content")),
-                "usage": data.get("usage", {}), "finish_reason": choice.get("finish_reason"),
-            }
-            with audit_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(audit, ensure_ascii=False) + "\n")
         content = message.get("content") or ""
         raw_path = None
         if audit_path:
             raw_path = audit_path.parent / f"llm-response-{uuid.uuid4().hex}.txt"
             raw_path.write_text(content.replace(self.key, "[REDACTED]"), encoding="utf-8")
+        if audit_path:
+            audit = {
+                "model": data.get("model"), "thinking": True,
+                "reasoning_effort": self.config["reasoning_effort"], "max_tokens": self.config["max_tokens"],
+                "reasoning_received": bool(message.get("reasoning_content")),
+                "usage": data.get("usage", {}), "finish_reason": choice.get("finish_reason"),
+                "format_attempt": _format_attempt, "response_file": str(raw_path),
+                "elapsed_seconds": round(time.monotonic() - started, 2),
+            }
+            with audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(audit, ensure_ascii=False) + "\n")
         if choice.get("finish_reason") != "stop":
-            if choice.get("finish_reason") == "length" and _format_attempt < 1:
-                print("[LLM] 响应达到长度上限，保留原文并请求一次精简的完整响应。", flush=True)
-                return self.complete(messages + [{"role": "user", "content":
-                    RESPONSE_BUDGET_RETRY}],
-                    audit_path, _format_attempt + 1)
-            raise RuntimeError(f"DeepSeek 响应未完整结束；原文：{raw_path}；没有应用部分代码。可续接任务重试。")
+            details = {"finish_reason": choice.get("finish_reason"), "usage": data.get("usage", {}),
+                       "max_tokens": self.config["max_tokens"], "reasoning_effort": self.config["reasoning_effort"],
+                       "response_file": str(raw_path) if raw_path else None}
+            if choice.get("finish_reason") == "length":
+                raise GenerationTruncated(details)
+            raise RuntimeError("DeepSeek未完整结束，未应用残缺响应：" + json.dumps(details, ensure_ascii=False))
         # Preserve the original response; only unwrap an entire Markdown fence.
         candidate = content.strip()
         if candidate.startswith("```") and candidate.endswith("```") and "\n" in candidate:
@@ -141,6 +150,7 @@ class DeepSeekClient:
 
     def _read_stream(self, response, started: float) -> dict:
         content, reasoning_received, finish, model, usage = [], False, None, self.config["model"], {}
+        answer_chars = 0
         last_progress = started
         done = False
         for raw in response:
@@ -148,7 +158,8 @@ class DeepSeekClient:
             if elapsed > self.config["timeout_seconds"]:
                 raise TimeoutError("LLM整体请求超时")
             if time.monotonic() - last_progress >= 15:
-                print(f"[LLM] 思考/生成中，已运行 {int(elapsed)} 秒", flush=True)
+                phase = "生成正文" if answer_chars else "思考/等待正文"
+                print(f"[LLM] {phase}，已运行 {int(elapsed)} 秒，已接收正文 {answer_chars} 字符", flush=True)
                 last_progress = time.monotonic()
             line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):
@@ -168,6 +179,7 @@ class DeepSeekClient:
                     reasoning_received = True
                 if delta.get("content"):
                     content.append(delta["content"])
+                    answer_chars += len(delta["content"])
                 finish = choice.get("finish_reason") or finish
         if not done:
             raise RuntimeError("DeepSeek流提前断开，未应用部分代码。")

@@ -7,11 +7,15 @@
 | `ANALYST` | `session.py`：需求分析 |
 | `PLANNER` | `session.py`：方案、测试方案和任务拆解 |
 | `EDITOR` | `development.py`：逐项交付和增量修复 |
+| `EDIT_RECOVERY_TASK` | `development.py`：截断后本轮只整理检查点和选择下一小步 |
 | `REVIEWER` | `agent.py`：集成验证后的独立上下文审查 |
 | `DIAGNOSTIC` | `agent.py`：实际工具或硬件故障诊断 |
 | `SYSTEM` | `agent.py`：保留旧版完整工程生成调用接口 |
+| `BOARD_RESEARCH` | `board_research.py`：资料动作、笔记、原文引用和候选配置 |
+| `RESEARCH_ACCESS` | `session.py`：需求/规划中可用的通用资料工具与研究笔记 |
+| `DOCUMENT_VISION` | `documents.py`：PDF页面图片的文字、表格与不确定性提取 |
 
-通用指令也放在同一文件：响应过长后的精简重试、JSON纠错、文件读取反馈、增量修复目标、报告摘录说明、连接检查以及旧版续接提示。
+通用指令也放在同一文件：截断后的检查点整理、JSON纠错、文件读取反馈、增量修复目标、报告摘录说明、连接检查以及旧版续接提示。
 
 `json_repair_instruction()` 插入实际解析错误，`read_instruction()` 根据读取轮次补充结束提醒。任务文档、板卡信息、工程文件、执行结果等动态数据继续由调用方组装，不混入提示词目录。
 

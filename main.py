@@ -1,4 +1,4 @@
-"""Minimal interactive FPGA agent CLI. Python 3.10+, no external packages."""
+"""Interactive FPGA development and board-document research CLI. Python 3.10+."""
 import argparse
 import json
 import os
@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 from fpga_agent.agent import DeepSeekClient, load_env
-from fpga_agent import workflow, session
+from fpga_agent import workflow, session, board_research
 from fpga_agent.interaction import read_reply
 
 from fpga_agent.prompts.catalog import HEALTH_CHECK
@@ -27,6 +27,8 @@ def main(argv=None) -> int:
     run.add_argument("--continue", dest="continue_existing", action="store_true", help="配合--resume恢复已保存的小任务，不重新规划")
     run.add_argument("--program", action="store_true", help="上板意图的默认提示；最终以任务需求和规划为准")
     run.add_argument("--target", choices=("sim", "build"), default="build", help="初始目标提示；用户后续要求可动态改变")
+    run.add_argument("--board", help="新任务选择已确认安装的boards配置id；续接沿用任务板卡")
+    run.add_argument("--source", action="append", default=[], help="本任务参考文件或URL，可重复指定；续接时可补充")
     run.add_argument("--effort", choices=("low", "high", "max"), help="本任务思考强度，默认读取config.json")
     run.add_argument("--non-interactive", action="store_true", help="需要用户回答时保存并暂停")
     program = commands.add_parser("program", help="下载已有任务的已验证产物")
@@ -45,6 +47,12 @@ def main(argv=None) -> int:
     verify.add_argument("task_id")
     verify.add_argument("--effort", choices=("low", "high", "max"))
     verify.add_argument("--candidate", help="复核任务内某个candidate JSON，避免重新生成代码")
+    research = commands.add_parser("board-research", help="自主搜索、读取手册并生成待确认板卡配置")
+    research.add_argument("--board", required=True, help="板卡配置id，例如axu15egb")
+    research.add_argument("--request", default="", help="型号、PCB版本、需要核实的资源和资料要求")
+    research.add_argument("--source", action="append", default=[], help="本地PDF/文本或官方URL，可重复指定")
+    research.add_argument("--resume", help="继续已有板卡资料任务")
+    research.add_argument("--non-interactive", action="store_true", help="需要确认时保存并退出")
     args = parser.parse_args(argv)
     try:
         config = workflow.load_config(args.config)
@@ -57,6 +65,7 @@ def main(argv=None) -> int:
             checks["proxy_mode"] = config["llm"].get("proxy_mode", "system")
             import importlib.util
             checks["python_plotting"] = bool(importlib.util.find_spec("matplotlib"))
+            checks["pdf_reading"] = bool(importlib.util.find_spec("pymupdf"))
             checks.update(workflow.environment_checks(config))
             print(json.dumps(checks, ensure_ascii=False, indent=2))
             if args.llm:
@@ -67,7 +76,12 @@ def main(argv=None) -> int:
                     raise ValueError("模型连接返回内容不符合预期。")
                 print("[LLM] 真实连接通过；调用元数据已记录，未保存密钥或原始思考文本。")
             return 0 if all(checks[k] for k in ("vivado", "api_key_present", "board_profile", "templates")) else 1
-        if args.command == "run":
+        if args.command == "board-research":
+            state = board_research.run(config, args.board, args.request, args.source,
+                                       ask=None if args.non_interactive else input, resume=args.resume)
+        elif args.command == "run":
+            if args.board:
+                config["board"] = args.board
             config["target"] = args.target
             config["program_default"] = args.program
             if args.effort:
@@ -84,7 +98,7 @@ def main(argv=None) -> int:
             if not request and not args.continue_existing:
                 raise ValueError("需求不能为空。")
             state = session.run(request, config, ask=None if args.non_interactive else input,
-                                task_id=args.resume, continue_existing=args.continue_existing)
+                                task_id=args.resume, continue_existing=args.continue_existing, sources=args.source)
             if state["status"] == "awaiting_acceptance" and not args.non_interactive:
                 automated = state.get("results", [{}])[-1].get("stage") == "hardware_analysis"
                 prompt = ("请核对硬件采样分析报告，是否接受自动验证结果？[y接受/n不接受，不代表目视验收]"
@@ -113,7 +127,7 @@ def main(argv=None) -> int:
                           "pending_confirmation": state.get("pending_confirmation"),
                           "report": str(Path(config["workspace_path"]) / state["task_id"] / "report.md")},
                          ensure_ascii=False, indent=2))
-        if state["status"] in {"waiting_for_user", "awaiting_confirmation"}:
+        if state["status"] in {"waiting_for_user", "awaiting_confirmation", "research_paused", "development_paused"}:
             return 2
         return 0 if state["status"] in {"simulation_verified", "ready_to_program", "awaiting_acceptance", "completed"} else 1
     except KeyboardInterrupt:

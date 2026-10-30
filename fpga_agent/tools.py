@@ -9,12 +9,24 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 
 
 def write_json(path: Path, value: dict) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        for attempt in range(4):
+            try:
+                temp.replace(path)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        with contextlib.suppress(FileNotFoundError, PermissionError):
+            temp.unlink()
 
 
 def file_hash(path: Path) -> str:

@@ -6,7 +6,7 @@
   "llm": {
     "base_url": "https://api.deepseek.com",
     "proxy_mode": "direct",
-    "model": "deepseek-v4-pro",
+    "model": "deepseek-flash",
     "thinking": true,
     "stream": true,
     "reasoning_effort": "high",
