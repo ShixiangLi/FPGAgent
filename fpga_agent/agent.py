@@ -220,7 +220,8 @@ def review_context(config: dict) -> dict:
 
 
 def review_project(request: str, spec: dict, design: dict, config: dict, audit_path: Path,
-                   simulation_result: dict | None = None, build_result: dict | None = None) -> dict:
+                   simulation_result: dict | None = None, build_result: dict | None = None,
+                   analysis_result: dict | None = None) -> dict:
     """Separate model context checks requirements/test coverage; not a proof of correctness."""
     if config.get("task_memory_path") and build_result:
         build_result = dict(build_result)
@@ -233,7 +234,8 @@ def review_project(request: str, spec: dict, design: dict, config: dict, audit_p
         {"role": "user", "content": json.dumps({"request": request, "target": config.get("target", "build"),
                                                  "spec": spec, "project": design,
                                                  "execution_context": review_context(config),
-                                                 "actual_simulation": simulation_result, "actual_build": build_result}, ensure_ascii=False)},
+                                                 "actual_simulation": simulation_result, "actual_build": build_result,
+                                                 "actual_analysis": analysis_result}, ensure_ascii=False)},
     ], audit_path)
 
 

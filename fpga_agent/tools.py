@@ -213,6 +213,11 @@ def program_device(config: dict, state: dict) -> dict:
                             rows = list(csv.DictReader(f))
                         if len(rows) != debug.get("samples", 30):
                             raise ValueError("VIO采样数量不完整。")
+                        times = [int(row["elapsed_ms"]) for row in rows]
+                        if not times or any(b <= a for a, b in zip(times, times[1:])):
+                            raise ValueError("VIO采样时间戳不完整或非递增。")
+                        if times[-1] - times[0] < debug.get("min_duration_ms", 0):
+                            raise ValueError("VIO实际采样跨度未达到min_duration_ms。")
                         checked = 0
                         for probe in debug["probes"]:
                             values = [int(row[probe["name"]], 16) for row in rows]
@@ -226,7 +231,8 @@ def program_device(config: dict, state: dict) -> dict:
                                 raise ValueError(f"{probe['name']} 切换次数不足。")
                             checked += bool(allowed or probe.get("min_changes"))
                         shutil.copy2(source, Path(result["run_dir"]) / source.name)
-                        result.update(samples=len(rows), hardware_verified=bool(checked), checked_probes=checked)
+                        result.update(samples=len(rows), duration_ms=times[-1] - times[0],
+                                      hardware_verified=bool(checked), checked_probes=checked)
                     except (OSError, ValueError, KeyError) as exc:
                         result.update(passed=False, diagnostic=str(exc))
             write_json(Path(result["run_dir"]) / "result.json", result)

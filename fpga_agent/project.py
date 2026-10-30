@@ -5,9 +5,7 @@ import re
 import shutil
 
 from .tools import write_json
-
-IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-PORT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]+\])?$")
+from .contract import file_path, project_fields, script_fields, validate_spec
 
 
 def board_profile(config: dict) -> dict:
@@ -17,42 +15,26 @@ def board_profile(config: dict) -> dict:
 
 def validate(response: dict, board: dict, target: str = "build") -> tuple[dict, dict]:
     spec = response.get("spec")
-    if not isinstance(spec, dict) or not isinstance(spec.get("summary"), str):
-        raise ValueError("spec 必须包含 summary、requirements、acceptance。")
-    for key in ("requirements", "acceptance"):
-        if not isinstance(spec.get(key), list) or not 1 <= len(spec[key]) <= 30 or any(
-                not isinstance(x, str) or not x.strip() for x in spec[key]):
-            raise ValueError(f"spec.{key} 必须是非空字符串列表。")
+    validate_spec(spec)
     project = response.get("project")
     if not isinstance(project, dict):
         raise ValueError("缺少 project 对象。")
-    for key in ("top", "testbench"):
-        if not isinstance(project.get(key), str) or not IDENT.fullmatch(project[key]) or project[key].startswith("agent_"):
-            raise ValueError(f"无效的 {key} 模块名。")
+    fields = project_fields(project, board, target)
     files = project.get("files")
     if not isinstance(files, dict) or not 2 <= len(files) <= 32:
         raise ValueError("files 必须包含2至32个RTL/仿真文件，可附README.md。")
     modules = {}
     folded = set()
     for name, content in files.items():
+        file_path(name)
         path = PurePosixPath(name)
-        if not re.fullmatch(r"[A-Za-z0-9_./-]+", name) or path.is_absolute() or ".." in path.parts:
-            raise ValueError(f"文件路径越界或非法：{name}")
         if name.casefold() in folded:
             raise ValueError("文件名存在大小写冲突。")
-        if path.stem.startswith("agent_"):
-            raise ValueError("文件名使用框架保留前缀。")
         folded.add(name.casefold())
         if not isinstance(content, str) or not content.strip() or len(content) > 160000:
             raise ValueError(f"文件内容无效：{name}")
-        if name == "README.md":
+        if path.parts[0] not in {"rtl", "sim"}:
             continue
-        if len(path.parts) == 2 and path.parts[0] == "scripts" and path.suffix == ".py":
-            continue
-        if len(path.parts) == 2 and path.parts[0] == "data" and path.suffix in {".hex", ".mem", ".txt", ".json", ".csv"}:
-            continue
-        if len(path.parts) != 2 or path.parts[0] not in {"rtl", "sim"} or path.suffix not in {".v", ".sv"}:
-            raise ValueError("模型只能生成rtl/、sim/中的Verilog/SystemVerilog及README.md。")
         # Locate modules only to assemble optional instrumentation, never to judge HDL.
         clean = re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*', lambda m: " " * len(m.group()), content, flags=re.S)
         for module in re.findall(r"\bmodule\s+(\w+)", clean):
@@ -61,54 +43,8 @@ def validate(response: dict, board: dict, target: str = "build") -> tuple[dict, 
         raise ValueError("工程文件总量过大。")
     if not files.get("README.md"):
         raise ValueError("完整工程必须包含README.md说明和验收步骤。")
-    timeout = project.get("simulation_timeout_ns", 100000)
-    if type(timeout) is not int or not 100 <= timeout <= 100000000:
-        raise ValueError("simulation_timeout_ns范围为100至100000000。")
-    bindings = project.get("bindings") or {}
-    if not isinstance(bindings, dict) or any(not PORT.fullmatch(p) for p in bindings):
-        raise ValueError("bindings必须是顶层端口名到板卡资源名的映射。")
-    if any(not isinstance(r, str) or r not in board["resources"] for r in bindings.values()):
-        raise ValueError("使用了未核实的板卡资源；请询问用户并补充boards配置，不能猜引脚。")
-    if len(set(bindings.values())) != len(bindings):
-        raise ValueError("多个端口不能占用同一个板卡资源。")
-    for resource in bindings.values():
-        pair = board["resources"][resource].get("pair")
-        if pair and pair not in bindings.values():
-            raise ValueError("差分时钟必须同时绑定P和N。")
-    if target == "build" and not any(board["resources"][r].get("period_ns") for r in bindings.values()):
-        raise ValueError("上板工程必须绑定已核实的板载时钟。纯逻辑仿真可使用--target sim。")
-    debug = project.get("debug")
-    if debug is not None:
-        if not isinstance(debug, dict) or not IDENT.fullmatch(str(debug.get("clock", ""))):
-            raise ValueError("debug.clock必须是顶层内的时钟信号名。")
-        probes = debug.get("probes")
-        if not isinstance(probes, list) or not 1 <= len(probes) <= 16:
-            raise ValueError("debug.probes需要1至16个信号。")
-        names = set()
-        for probe in probes:
-            if not isinstance(probe, dict):
-                raise ValueError("每个debug探针必须是对象。")
-            name, width = probe.get("name"), probe.get("width")
-            if not isinstance(name, str) or not IDENT.fullmatch(name) or name in names or type(width) is not int or not 1 <= width <= 32:
-                raise ValueError("debug探针必须为不重复的信号名，宽度1至32。")
-            names.add(name)
-            values = probe.get("allowed_values", [])
-            if not isinstance(values, list) or any(type(v) is not int or not 0 <= v < 2**width for v in values):
-                raise ValueError("探针allowed_values超出位宽。")
-            changes = probe.get("min_changes", 0)
-            if type(changes) is not int or not 0 <= changes <= 100:
-                raise ValueError("min_changes必须为0至100。")
-        for key, default, low, high in (("sample_ms", 100, 10, 1000), ("samples", 30, 10, 300)):
-            v = debug.get(key, default)
-            if type(v) is not int or not low <= v <= high:
-                raise ValueError(f"debug.{key}超出范围。")
-    normalized = {"top": project["top"], "testbench": project["testbench"],
-                  "simulation_timeout_ns": timeout, "bindings": bindings, "debug": debug,
-                  "files": files, "top_file": modules.get(project["top"])}
-    script = project.get("analysis_script")
-    if script is not None and (script not in files or not script.startswith("scripts/") or not script.endswith(".py")):
-        raise ValueError("analysis_script必须指向files中的scripts/*.py文件。")
-    normalized["analysis_script"] = script
+    normalized = {**fields, "files": files, "top_file": modules.get(project["top"])}
+    normalized.update(script_fields(project, set(files)))
     return spec, normalized
 
 

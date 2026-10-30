@@ -79,7 +79,7 @@ def save(task: Path, state: dict) -> None:
             report.append(f"  实板样本 {result['samples']} 个，切换 {result['transitions']} 次。")
         if "hardware_verified" in result:
             report.append(f"  自动探针规则验证：{result['hardware_verified']}。未启用规则时PASS仅表示下载成功。")
-    report.extend(["\n## 现场验收", f"\n{state.get('acceptance', '待用户按本任务验收条件进行现场确认。')}",
+    report.extend(["\n## 用户验收", f"\n{state.get('acceptance', '待用户按本任务验收范围确认结果。')}",
                    "\n模型生成测试和同模型独立上下文审查不是形式证明。VIO仅检查已配置的探针规则，现场观察不能替代精确仪器测量。",
                    "\n下载策略为易失 PL 配置，不写 QSPI/eMMC；是否已执行下载以program阶段记录为准。"])
     if state.get("build_hash"):
@@ -100,9 +100,11 @@ def prepare_project(task: Path, config: dict, spec: dict, design: dict) -> dict:
 
 def runtime_config(task: Path, config: dict, state: dict) -> dict:
     generic = (task / "project/project.json").is_file()
+    metadata = json.loads((task / "project/project.json").read_text(encoding="utf-8")) if generic else {}
     scripts = ({"simulation": "generic_sim.tcl", "build": "generic_build.tcl", "probe": "probe.tcl", "program": "generic_program.tcl"}
                if generic else {"simulation": "sim.tcl", "build": "build.tcl", "probe": "probe.tcl", "program": "program.tcl"})
     return {**config, "project_path": str(task / "project"), "generic": generic, "scripts": scripts,
+            "hardware_analysis": metadata.get("hardware_analysis"),
             "step_ms": state.get("spec", {}).get("step_ms", 500)}
 
 
@@ -133,12 +135,14 @@ def develop(task: Path, state: dict, config: dict, response: dict) -> dict:
             state["results"].append(result)
             simulation_result = result
             build_result = None
+            analysis_result = None
             if result["passed"] and config.get("visualization"):
                 state["status"] = "analyzing"
                 save(task, state)
                 task_memory.event(task, "Python", "根据本次真实仿真VCD生成波形图片和信号摘要")
                 result = python_tool.run(runtime)
                 state["results"].append(result)
+                analysis_result = result
             if result["passed"] and config.get("target") != "sim":
                 state["status"] = "building"
                 save(task, state)
@@ -149,7 +153,7 @@ def develop(task: Path, state: dict, config: dict, response: dict) -> dict:
                 state["status"] = "reviewing"
                 save(task, state)
                 review_request = json.dumps(task_memory.context(task), ensure_ascii=False) if state.get("plan") else state["request"]
-                review = review_project(review_request, spec, design, config, task / "llm_calls.jsonl", simulation_result, build_result)
+                review = review_project(review_request, spec, design, config, task / "llm_calls.jsonl", simulation_result, build_result, analysis_result)
                 review_dir = task / "runs" / f"review-{revision_id}-{attempt}"
                 review_dir.mkdir(parents=True, exist_ok=True)
                 tools.write_json(review_dir / "review.json", review)
@@ -328,6 +332,12 @@ def deploy(task_id: str, config: dict) -> dict:
                 save(task, state)
                 result = tools.program_device(runtime, state)
                 state["results"].append(result)
+            if result["passed"] and runtime.get("hardware_analysis"):
+                state["status"] = "analyzing_hardware"
+                save(task, state)
+                task_memory.event(task, "硬件分析", "将本次VIO实际采样CSV交给已交付Python脚本")
+                result = python_tool.hardware(runtime, result)
+                state["results"].append(result)
             state["status"] = "awaiting_acceptance" if result["passed"] else "hardware_failed"
             if not result["passed"]:
                 state["error"] = f"{result['stage']} 失败，详见 {result['run_dir']}"
@@ -370,7 +380,9 @@ def accept(task_id: str, config: dict, passed: bool, note: str) -> dict:
         if state["status"] not in {"awaiting_acceptance", "completed", "acceptance_failed"}:
             raise ValueError("实板自动验证通过后才可记录现场验收。")
         tools.verify_artifact(task / "project", state)
+        last = state.get("results", [{}])[-1] if state.get("results") else {}
+        source = "user_review_of_automated_evidence" if last.get("stage") == "hardware_analysis" and last.get("passed") else "user_observation"
         state.update(status="completed" if passed else "acceptance_failed",
-                     acceptance={"passed": passed, "note": note, "source": "user_observation"})
+                     acceptance={"passed": passed, "note": note, "source": source})
         save(task, state)
         return state

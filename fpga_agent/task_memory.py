@@ -40,6 +40,7 @@ def sync(task, state):
               for r in state.get("results", [])[-5:]]
     progress = {"status": state["status"], "recent_results": recent,
                 "error": state.get("error", "")[-3000:], "acceptance": state.get("acceptance"),
+                "plan_contract_errors": state.get("plan_contract_errors", []),
                 "pending_confirmation": state.get("pending_confirmation"), "confirmations": state.get("confirmations", {})}
     document(task, "progress.md", "# 当前进度\n\n" + json.dumps(progress, ensure_ascii=False, indent=2) + "\n")
     document(task, "tasks.md", "# 开发任务清单\n\n交付文件不等于功能验证通过；集成验证结果另行记录。\n\n"

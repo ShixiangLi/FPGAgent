@@ -185,3 +185,17 @@ def json_repair_instruction(detail: str) -> str:
 def read_instruction(last_turn: bool) -> str:
     """Remind the editor what it has read and when it must finish."""
     return READ_FILE_CONTEXT + (LAST_READ_INSTRUCTION if last_turn else "")
+
+
+PLAN_CONTRACT = """执行能力以execution_contract为准。规划必须符合其中的文件类型、元数据和执行阶段。
+框架从bindings生成XDC/Tcl，从debug注入VIO，统一导出VCD并等待testbench.done；不要安排用户交付XDC/Tcl、实例化VIO、$dumpfile/$dumpvars或正常$finish。
+上板时project.top/testbench必须是模块名而非路径，bindings绑定核实资源。VIO通过project.debug声明clock/probes/sample_ms/samples/min_duration_ms。
+若要求采样至少10秒，应设置min_duration_ms=10000，samples和sample_ms的计划跨度必须覆盖它；实际跨度还会由执行器根据时间戳核对。
+需要硬件采样后Python分析时，project.hardware_analysis={"script":"scripts/analyze_hw.py","outputs":["hardware_plot.png","hardware_report.md"]}，且该脚本有交付任务。
+硬件分析脚本通过--input接收本次真实VIO CSV，通过--output接收产物目录；elapsed_ms为十进制时间戳，探针列为十六进制值。
+脚本使用断言或非零退出报告验证失败，生成所有声明产物，不得将内部采样描述为实际发光或目视验证。
+"""
+
+PLAN_REPAIR = """先前计划违反了执行接口。根据validation_errors和execution_contract修正proposed_plan，返回完整plan JSON，不生成代码。
+冻结的已确认需求必须原样保留，不通过删除要求、缩短采样时间或降低指标消除错误。如果需求无法满足或需要用户选择，返回clarify明确说明。
+"""

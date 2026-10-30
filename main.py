@@ -86,11 +86,15 @@ def main(argv=None) -> int:
             state = session.run(request, config, ask=None if args.non_interactive else input,
                                 task_id=args.resume, continue_existing=args.continue_existing)
             if state["status"] == "awaiting_acceptance" and not args.non_interactive:
+                automated = state.get("results", [{}])[-1].get("stage") == "hardware_analysis"
+                prompt = ("请核对硬件采样分析报告，是否接受自动验证结果？[y接受/n不接受，不代表目视验收]"
+                          if automated else "按本任务的验收条件，现场功能正常？[y正常/n异常]")
                 answer = read_reply(Path(config["workspace_path"]) / state["task_id"], input,
-                                    "按本任务的验收条件，现场功能正常？[y正常/n异常]").lower()
+                                    prompt).lower()
                 if answer in {"y", "n"}:
+                    note = ("用户接受自动采样分析结果（未进行目视验收）" if automated else "用户按本任务验收条件确认功能正常") if answer == "y" else "用户反馈异常"
                     state = workflow.accept(state["task_id"], config, answer == "y",
-                                            "用户按本任务验收条件确认功能正常" if answer == "y" else "用户反馈异常")
+                                            note)
         elif args.command == "program":
             state = workflow.deploy(args.task_id, config)
         elif args.command == "accept":

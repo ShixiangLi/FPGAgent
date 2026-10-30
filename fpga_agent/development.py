@@ -1,9 +1,8 @@
 """Sequential, checkpointed file delivery. No parallel scheduler or plugin system."""
 import json
-from pathlib import PurePosixPath
-import re
 
 from .agent import DeepSeekClient, project_context
+from .contract import file_path, validate_tasks
 from . import task_memory as memory, tools
 
 from .prompts.catalog import (
@@ -11,52 +10,6 @@ from .prompts.catalog import (
     read_instruction,
 )
 
-
-def file_path(name):
-    if not isinstance(name, str):
-        raise ValueError("文件路径必须是字符串。")
-    p = PurePosixPath(name)
-    allowed = name == "README.md" or (len(p.parts) == 2 and (
-        (p.parts[0] in {"rtl", "sim"} and p.suffix in {".sv", ".v"}) or
-        (p.parts[0] == "scripts" and p.suffix == ".py") or
-        (p.parts[0] == "data" and p.suffix in {".hex", ".mem", ".txt", ".json", ".csv"})))
-    if not re.fullmatch(r"[A-Za-z0-9_./-]+", name) or ".." in p.parts or p.is_absolute() or not allowed or p.stem.startswith("agent_"):
-        raise ValueError(f"非法工程文件路径：{name}")
-    return name
-
-
-def validate_tasks(items):
-    if not isinstance(items, list) or not 1 <= len(items) <= 24:
-        raise ValueError("development_tasks需要1至24个小任务。")
-    known, owners = set(), set()
-    for item in items:
-        if not isinstance(item, dict) or not re.fullmatch(r"[A-Za-z0-9_-]+", str(item.get("id", ""))) or item["id"] in known:
-            raise ValueError("开发任务id必须唯一。")
-        if item.get("kind", "files") not in {"files", "python"}:
-            raise ValueError("任务kind只能为files或python。")
-        if not isinstance(item.get("depends_on", []), list) or any(d not in known for d in item.get("depends_on", [])):
-            raise ValueError("任务依赖必须指向清单中更早的任务，不能有环。")
-        for key in ("goal", "completion"):
-            if not isinstance(item.get(key), str) or not item[key].strip():
-                raise ValueError(f"任务缺少{key}。")
-        for key in ("inputs", "outputs"):
-            if not isinstance(item.get(key, []), list):
-                raise ValueError(f"{key}必须是路径列表。")
-            for name in item.get(key, []):
-                file_path(name)
-        outputs = item.get("outputs", [])
-        if not 1 <= len(outputs) <= 3 or len(set(outputs)) != len(outputs) or owners.intersection(outputs):
-            raise ValueError("每个任务应声明1至3个独占输出文件。")
-        if any(name not in owners for name in item.get("inputs", [])):
-            raise ValueError("任务输入必须由更早的任务交付。")
-        if item.get("kind") == "python":
-            if item.get("script") not in item.get("inputs", []) or not item["script"].startswith("scripts/"):
-                raise ValueError("Python任务script必须是已交付的输入脚本。")
-            if any(not name.startswith("data/") for name in outputs):
-                raise ValueError("预处理Python任务只能声明data/输出。")
-        owners.update(outputs)
-        known.add(item["id"])
-    return items
 
 
 def edit(task, config, goal, files, initial, allowed=None, read_only=None):

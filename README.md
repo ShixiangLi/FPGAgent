@@ -6,6 +6,8 @@
 
 系统提示词及通用模型指令集中维护在 [`fpga_agent/prompts/catalog.py`](fpga_agent/prompts/catalog.py)，职责与维护方式见[提示词说明](fpga_agent/prompts/README.md)。核心模块保留流程和动态数据组装。
 
+方案在用户确认前按[统一执行接口](docs/execution-contract.md)检查并反馈模型修正；规划和工程组装共享规则。已接通VIO采样后的Python分析阶段，可声明实际采样时长、分析脚本和必需报告产物。
+
 开发前有两个用户确认点：先确认需求分析，再确认设计与测试方案。输入 `y` 或 `确认` 继续，输入修改意见让模型重新整理，输入 `/pause` 暂停；空行不会提交，会继续等待。需求未确认不生成方案，方案未确认不生成代码。确认记录绑定内容摘要，修改后受影响的确认需重新进行。当前测试方案保存在任务目录的 `test_plan.md`。
 
 模型为 `deepseek-v4-pro`，开启 `thinking`，默认 `reasoning_effort=high`。Python 3.10+，绘图使用 matplotlib；安装依赖：` .\.venv\Scripts\python.exe -m pip install -r requirements.txt `。

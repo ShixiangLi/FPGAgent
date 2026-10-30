@@ -9,30 +9,20 @@ from . import workflow, tools, task_memory as memory
 from .development import build_project
 from .confirmation import confirm, digest
 from .interaction import read_reply
+from . import contract
+from .project import board_profile
 
-from .prompts.catalog import ANALYST, PLANNER
+from .prompts.catalog import ANALYST, PLANNER, PLAN_CONTRACT, PLAN_REPAIR
 
 
-def _model(task, state, config, request, system, confirmed=None):
+def _model(task, state, config, request, system, confirmed=None, proposed=None, errors=None):
     payload = {"current_documents": memory.context(task), "latest_user_input": request,
-               "confirmed_requirements": confirmed,
+               "confirmed_requirements": confirmed, "execution_contract": contract.describe(),
+               "proposed_plan": proposed, "validation_errors": errors,
                "defaults": {"target": config.get("target"), "program": config.get("program_default", False)}}
     return DeepSeekClient(config).complete([
-        {"role": "system", "content": system + project_context(config)},
+        {"role": "system", "content": system + PLAN_CONTRACT + project_context(config)},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], task / "llm_calls.jsonl")
-
-
-def _validate_requirements(analysis):
-    spec = analysis.get("spec")
-    if not isinstance(spec, dict) or not isinstance(spec.get("summary"), str):
-        raise ValueError("Requirements must contain spec.summary.")
-    for key in ("requirements", "acceptance"):
-        if not isinstance(spec.get(key), list) or not spec[key] or any(not isinstance(x, str) or not x.strip() for x in spec[key]):
-            raise ValueError(f"spec.{key} must contain nonempty strings.")
-    if analysis.get("target") not in {"sim", "build"} or any(type(analysis.get(k)) is not bool for k in ("program", "visualization")):
-        raise ValueError("Requirements must specify target, program and visualization.")
-    if analysis["program"] and analysis["target"] != "build":
-        raise ValueError("Programming requires a build target.")
 
 
 def _answer(task, state, ask):
@@ -40,6 +30,30 @@ def _answer(task, state, ask):
     workflow.save(task, state)
     memory.event(task, "提问", state["question"])
     return read_reply(task, ask, "请回答")
+
+
+def _executable_plan(task, state, config, request, analysis, plan):
+    """Repair interface errors before asking the user to approve a plan."""
+    attempts = task / "planning"
+    attempts.mkdir(exist_ok=True)
+    tools.write_json(task / "execution_contract.json", contract.describe())
+    for attempt in range(config.get("max_plan_repairs", 3) + 1):
+        if plan is None:
+            plan = _model(task, state, config, request, PLANNER, analysis)
+        if plan.get("action") == "clarify":
+            return plan
+        errors = contract.plan_errors(plan, analysis, board_profile(config))
+        tools.write_json(attempts / (uuid.uuid4().hex + ".json"), {"plan": plan, "errors": errors})
+        state["plan_contract_errors"] = errors
+        if not errors:
+            tools.write_json(task / "plan_response.json", plan)
+            return plan
+        state["status"] = "repairing_plan"
+        workflow.save(task, state)
+        memory.event(task, "计划接口反馈", "\n".join(errors))
+        if attempt == config.get("max_plan_repairs", 3):
+            raise ValueError("Plan contract repair limit: " + "; ".join(errors))
+        plan = _model(task, state, config, request, PLANNER + PLAN_REPAIR, analysis, plan, errors)
 
 
 def run(request, config, ask=None, task_id=None, continue_existing=False):
@@ -96,7 +110,7 @@ def run(request, config, ask=None, task_id=None, continue_existing=False):
                         continue
                     if analysis.get("action") != "requirements":
                         raise ValueError("Model did not return requirements analysis.")
-                _validate_requirements(analysis)
+                contract.validate_requirements(analysis)
                 state.update(requirements_analysis=analysis, spec=analysis["spec"], question=None)
                 decision, revision = confirm(task, state, "requirements", "需求分析", analysis, ask)
                 if decision == "paused":
@@ -107,25 +121,18 @@ def run(request, config, ask=None, task_id=None, continue_existing=False):
                 if plan is None:
                     state["status"] = "planning"
                     workflow.save(task, state)
-                    plan = _model(task, state, config, request, PLANNER, analysis)
-                    tools.write_json(task / "plan_response.json", plan)
-                    if plan.get("action") == "clarify":
-                        state["question"] = plan.get("message", "Please clarify the plan.")
-                        request = _answer(task, state, ask)
-                        if not request:
-                            return state
-                        analysis, plan = None, None
-                        continue
-                if plan.get("action") != "plan" or not isinstance(plan.get("design"), str):
-                    raise ValueError("Model did not return a valid design plan.")
-                if any(plan.get(k) != analysis[k] for k in ("spec", "target", "program", "visualization")):
-                    raise ValueError("Plan changed confirmed requirements; revise the requirements first.")
                 # Old tasks can present their existing design and verification approach for approval.
-                if not isinstance(plan.get("test_plan"), str) or not plan["test_plan"].strip():
+                if plan and (not isinstance(plan.get("test_plan"), str) or not plan["test_plan"].strip()):
                     if continue_existing:
                         plan = {**plan, "test_plan": plan["design"]}
-                    else:
-                        raise ValueError("Plan must include a concrete test_plan.")
+                plan = _executable_plan(task, state, config, request, analysis, plan)
+                if plan.get("action") == "clarify":
+                    state["question"] = plan.get("message", "Please clarify the plan.")
+                    request = _answer(task, state, ask)
+                    if not request:
+                        return state
+                    analysis, plan = None, None
+                    continue
                 state.update(plan=plan, target=plan["target"], question=None)
                 approval_content = {"requirements": analysis, "design": plan["design"], "test_plan": plan["test_plan"],
                                     "project": plan.get("project"), "development_tasks": plan.get("development_tasks")}
