@@ -1,0 +1,25 @@
+{
+  "board": "axu15egb",
+  "project_dir": "projects/led",
+  "workspace_dir": "workspace",
+  "vivado_path": "F:/software/xilinx/Vivado/2024.2/bin/vivado.bat",
+  "llm": {
+    "base_url": "https://api.deepseek.com",
+    "proxy_mode": "direct",
+    "model": "deepseek-v4-pro",
+    "thinking": true,
+    "stream": true,
+    "reasoning_effort": "high",
+    "max_tokens": 32768,
+    "timeout_seconds": 600
+  },
+  "max_repairs": 10,
+  "target": "build",
+  "tool_timeout_seconds": 1800,
+  "scripts": {
+    "simulation": "generic_sim.tcl",
+    "build": "generic_build.tcl",
+    "probe": "probe.tcl",
+    "program": "generic_program.tcl"
+  }
+}

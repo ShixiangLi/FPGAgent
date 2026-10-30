@@ -1,0 +1,12 @@
+{
+  "id": "axu15egb",
+  "part": "xczu15eg-ffvb1156-2-i",
+  "source": "AXU15EGB manual pages 22, 52, 53; validated in prior board runs",
+  "resources": {
+    "pl_clk_p": {"pin": "AL8", "standard": "DIFF_SSTL12", "direction": "input", "period_ns": 5.0, "pair": "pl_clk_n"},
+    "pl_clk_n": {"pin": "AL7", "standard": "DIFF_SSTL12", "direction": "input", "pair": "pl_clk_p"},
+    "pl_key": {"pin": "AN12", "standard": "LVCMOS33", "direction": "input", "pullup": true, "active_low": true},
+    "pl_led1": {"pin": "AM13", "standard": "LVCMOS33", "direction": "output", "active_low": true},
+    "pl_led2": {"pin": "AP12", "standard": "LVCMOS33", "direction": "output", "active_low": true}
+  }
+}
