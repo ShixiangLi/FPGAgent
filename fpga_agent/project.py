@@ -9,6 +9,8 @@ from .contract import file_path, project_fields, script_fields, validate_spec
 
 
 def board_profile(config: dict) -> dict:
+    if config.get("board_snapshot"):
+        return config["board_snapshot"]
     if not re.fullmatch(r"[a-z][a-z0-9_]*", config["board"]):
         raise ValueError("Invalid board profile id")
     path = Path(config["root"]) / "boards" / (config["board"] + ".json")

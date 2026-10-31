@@ -4,14 +4,17 @@ import os
 import socket
 import ssl
 import time
-import uuid
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 from .prompts.catalog import (
-    SYSTEM, REVIEWER, DIAGNOSTIC, LEGACY_REPAIR_INSTRUCTION,
-    REPORT_EXCERPT_NOTE, PROJECT_CONTEXT_PREFIX,
+    DIAGNOSTIC,
+    LEGACY_REPAIR_INSTRUCTION,
+    PROJECT_CONTEXT_PREFIX,
+    REVIEWER,
+    SYSTEM,
     json_repair_instruction,
 )
 
@@ -233,22 +236,36 @@ def review_context(config: dict) -> dict:
 
 def review_project(request: str, spec: dict, design: dict, config: dict, audit_path: Path,
                    simulation_result: dict | None = None, build_result: dict | None = None,
-                   analysis_result: dict | None = None) -> dict:
+                   analysis_result: dict | None = None, previous_review: dict | None = None, user_reply=None,
+                   additional_executions=None) -> dict:
     """Separate model context checks requirements/test coverage; not a proof of correctness."""
-    if config.get("task_memory_path") and build_result:
-        build_result = dict(build_result)
-        build_result["diagnostic"] = build_result.get("diagnostic", "")[-3000:]
-        build_result["reports"] = {name: text[:1800] + "\n...\n" + text[-1800:]
-            for name, text in build_result.get("reports", {}).items()}
-        build_result["report_note"] = REPORT_EXCERPT_NOTE
-    return DeepSeekClient(config).complete([
-        {"role": "system", "content": REVIEWER},
-        {"role": "user", "content": json.dumps({"request": request, "target": config.get("target", "build"),
-                                                 "spec": spec, "project": design,
-                                                 "execution_context": review_context(config),
-                                                 "actual_simulation": simulation_result, "actual_build": build_result,
-                                                 "actual_analysis": analysis_result}, ensure_ascii=False)},
-    ], audit_path)
+    from . import model_steps
+    from .contract import describe
+    from .project import board_profile
+    task = audit_path.parent
+    files = {'project/' + name: text for name, text in design.get('files', {}).items()}
+    evidence = {name: model_steps.evidence_context(task, result, files) for name, result in (
+        ('actual_simulation', simulation_result), ('actual_build', build_result), ('actual_analysis', analysis_result))}
+    evidence['additional_executions'] = [model_steps.evidence_context(task, r, files)
+                                         for r in (additional_executions or [])]
+    payload = {'request': request, 'target': config.get('target', 'build'), 'spec': spec,
+               'project': {k: v for k, v in design.items() if k != 'files'},
+               'execution_contract': describe(board_profile(config)), 'previous_review': previous_review,
+               'execution_context': review_context(config), **evidence}
+
+    def validate(result):
+        if (type(result.get('approved')) is not bool or not isinstance(result.get('coverage'), dict)
+                or any(not isinstance(result.get(k), list) for k in ('blocking_findings', 'warnings', 'pending_checks'))):
+            return ['Review requires approved:boolean, blocking_findings, warnings, pending_checks and coverage']
+        return []
+
+    identity = {'request': request, 'spec': spec, 'project': design, 'runs': [
+        r.get('run_dir') if r else None for r in (simulation_result, build_result, analysis_result)],
+        'previous_review': previous_review}
+    if additional_executions:
+        identity['additional_executions'] = [r['run_dir'] for r in additional_executions]
+    return model_steps.run(task, config, 'review', identity,
+                           REVIEWER, payload, files=files, validate=validate, user_reply=user_reply)
 
 
 def explain_failure(result: dict, config: dict, audit_path: Path | None = None) -> dict:

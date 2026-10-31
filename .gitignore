@@ -6,6 +6,5 @@ workspace/*
 .env
 .env.*
 !.env.example
-tests/
 workspace/
 .validation/

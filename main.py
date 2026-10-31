@@ -2,13 +2,12 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
+from fpga_agent import analysis_session, board_research, session, workflow
 from fpga_agent.agent import DeepSeekClient, load_env
-from fpga_agent import workflow, session, board_research
 from fpga_agent.interaction import read_reply
-
 from fpga_agent.prompts.catalog import HEALTH_CHECK
 
 
@@ -22,7 +21,7 @@ def main(argv=None) -> int:
     doctor = commands.add_parser("doctor", help="检查环境，不启动构建")
     doctor.add_argument("--llm", action="store_true", help="额外发起一次真实模型连通性请求")
     run = commands.add_parser("run", help="自然语言需求 -> RTL -> 仿真 -> 构建")
-    run.add_argument("--request", help="开发需求；续接时可补充回答或修改需求")
+    run.add_argument("--request", help="开发需求；续接时修改整体需求，回答开发澄清请使用--continue")
     run.add_argument("--resume", help="继续或修改已有通用任务")
     run.add_argument("--continue", dest="continue_existing", action="store_true", help="配合--resume恢复已保存的小任务，不重新规划")
     run.add_argument("--program", action="store_true", help="上板意图的默认提示；最终以任务需求和规划为准")
@@ -43,20 +42,40 @@ def main(argv=None) -> int:
     status.add_argument("task_id")
     diagnosis = commands.add_parser("diagnose", help="让DeepSeek解释已有失败，不修改代码或下载")
     diagnosis.add_argument("task_id")
+    analysis = commands.add_parser("analyze", help="由DeepSeek决定如何分析已有CSV/VCD；不修改RTL或重新下载")
+    analysis.add_argument("task_id")
+    analysis.add_argument("--candidate", help="任务内基线candidate JSON相对路径")
+    analysis.add_argument("--source", help="任务内真实CSV/VCD相对路径")
+    analysis.add_argument("--script", help="candidate内的scripts/*.py")
+    analysis.add_argument("--request", help="本轮分析范围与用户要求")
+    analysis.add_argument("--resume", help="继续已有分析会话ID")
+    analysis.add_argument("--answer", help="回答该分析会话的待澄清问题")
+    analysis.add_argument("--non-interactive", action="store_true", help="需要用户回答时保存并退出")
     verify = commands.add_parser("verify", help="重新验证现有通用工程，不调用模型重新生成代码")
     verify.add_argument("task_id")
     verify.add_argument("--effort", choices=("low", "high", "max"))
     verify.add_argument("--candidate", help="复核任务内某个candidate JSON，避免重新生成代码")
+    verify.add_argument('--continue', dest='continue_existing', action='store_true', help='继续暂停的审查/修复阶段，复用未变更源码的工具证据')
     research = commands.add_parser("board-research", help="自主搜索、读取手册并生成待确认板卡配置")
     research.add_argument("--board", required=True, help="板卡配置id，例如axu15egb")
     research.add_argument("--request", default="", help="型号、PCB版本、需要核实的资源和资料要求")
     research.add_argument("--source", action="append", default=[], help="本地PDF/文本或官方URL，可重复指定")
     research.add_argument("--resume", help="继续已有板卡资料任务")
     research.add_argument("--non-interactive", action="store_true", help="需要确认时保存并退出")
+    for command in (run, verify, analysis, research):
+        command.add_argument('--max-tokens', type=int, help='本次运行的模型输出预算，由用户显式选择，不改写config.json')
+    for command in (analysis, research):
+        command.add_argument('--effort', choices=('low', 'high', 'max'), help='本次运行的思考强度')
     args = parser.parse_args(argv)
     try:
         config = workflow.load_config(args.config)
         load_env(Path(config["root"]) / ".env")
+        if getattr(args, 'max_tokens', None) is not None:
+            if args.max_tokens < 1:
+                raise ValueError('--max-tokens必须为正整数。')
+            config['llm']['max_tokens'] = args.max_tokens
+        if getattr(args, 'effort', None):
+            config['llm']['reasoning_effort'] = args.effort
         if args.command == "doctor":
             checks = {"vivado": Path(config["vivado_path"]).is_file(),
                       "api_key_present": bool(os.environ.get("DEEPSEEK_API_KEY")),
@@ -84,8 +103,6 @@ def main(argv=None) -> int:
                 config["board"] = args.board
             config["target"] = args.target
             config["program_default"] = args.program
-            if args.effort:
-                config["llm"]["reasoning_effort"] = args.effort
             request = args.request
             if args.continue_existing and (not args.resume or request):
                 raise ValueError("--continue需要--resume且不能同时提供新需求；修改需求请使用--request。")
@@ -113,21 +130,33 @@ def main(argv=None) -> int:
             state = workflow.deploy(args.task_id, config)
         elif args.command == "accept":
             state = workflow.accept(args.task_id, config, args.passed, args.note)
+        elif args.command == "analyze":
+            state = analysis_session.run(args.task_id, config, candidate=args.candidate, source=args.source,
+                                         script=args.script, request=args.request, resume=args.resume, answer=args.answer)
+            while state["status"] == "waiting_for_user" and not args.non_interactive:
+                folder = Path(state["report"]).parent
+                reply = read_reply(folder, input, state.get("question") or "请补充")
+                if not reply:
+                    break
+                state = analysis_session.run(args.task_id, config, resume=state["analysis_id"], answer=reply)
+            print(json.dumps({k: state.get(k) for k in ("analysis_id", "status", "assessment", "question", "feedback", "model_pause", "report")}, ensure_ascii=False, indent=2))
+            if state["status"] in {"waiting_for_user", "paused", "model_paused", "interrupted"}:
+                return 2
+            return 0 if state["status"] == "reviewed" and state.get("assessment", {}).get("approved") else 1
         elif args.command == "diagnose":
             state = workflow.diagnose(args.task_id, config)
         elif args.command == "verify":
-            if args.effort:
-                config["llm"]["reasoning_effort"] = args.effort
-            state = workflow.verify_task(args.task_id, config, args.candidate)
+            state = workflow.verify_task(args.task_id, config, args.candidate, args.continue_existing)
         else:
             task = workflow.task_path(config, args.task_id)
             state = json.loads((task / "state.json").read_text(encoding="utf-8"))
         print(json.dumps({"task_id": state["task_id"], "status": state["status"],
                           "spec": state.get("spec"), "error": state.get("error"),
                           "pending_confirmation": state.get("pending_confirmation"),
+                          'model_pause': state.get('model_pause'),
                           "report": str(Path(config["workspace_path"]) / state["task_id"] / "report.md")},
                          ensure_ascii=False, indent=2))
-        if state["status"] in {"waiting_for_user", "awaiting_confirmation", "research_paused", "development_paused"}:
+        if state["status"] in {"waiting_for_user", "awaiting_confirmation", "research_paused", "development_paused", 'model_paused'}:
             return 2
         return 0 if state["status"] in {"simulation_verified", "ready_to_program", "awaiting_acceptance", "completed"} else 1
     except KeyboardInterrupt:

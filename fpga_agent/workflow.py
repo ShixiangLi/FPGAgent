@@ -1,18 +1,19 @@
 """A small persisted workflow: DeepSeek RTL -> simulation -> implementation -> hardware."""
-from datetime import datetime
 import json
-from pathlib import Path
 import re
 import uuid
+from datetime import datetime
+from pathlib import Path
 
-from .agent import handle_message, analyze_result, explain_failure, review_project
+from . import model_steps, python_tool, task_memory, tools
 from . import project as project_model
-from . import tools, task_memory, python_tool
+from .agent import analyze_result, explain_failure, handle_message, review_project
 from .interaction import read_reply
-
 from .prompts.catalog import (
-    RESUME_REQUEST_PREFIX, RESUME_REQUEST_SUFFIX,
-    CURRENT_PROJECT_PREFIX, LAST_FAILURE_PREFIX,
+    CURRENT_PROJECT_PREFIX,
+    LAST_FAILURE_PREFIX,
+    RESUME_REQUEST_PREFIX,
+    RESUME_REQUEST_SUFFIX,
 )
 
 
@@ -88,6 +89,8 @@ def save(task: Path, state: dict) -> None:
                        f"\n产物摘要：`{json.dumps(state.get('artifact', {}))}`"])
     if state.get("error"):
         report.append(f"\n最近错误：{state['error']}")
+    if state.get('model_pause'):
+        report.extend(['\n## 模型阶段续接', '\n' + json.dumps(state['model_pause'], ensure_ascii=False, indent=2)])
     (task / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
 
 
@@ -105,114 +108,184 @@ def runtime_config(task: Path, config: dict, state: dict) -> dict:
     scripts = ({"simulation": "generic_sim.tcl", "build": "generic_build.tcl", "probe": "probe.tcl", "program": "generic_program.tcl"}
                if generic else {"simulation": "sim.tcl", "build": "build.tcl", "probe": "probe.tcl", "program": "program.tcl"})
     return {**config, "project_path": str(task / "project"), "generic": generic, "scripts": scripts,
+            'board_snapshot': metadata.get('board') or config.get('board_snapshot'),
             "hardware_analysis": metadata.get("hardware_analysis"),
             "step_ms": state.get("spec", {}).get("step_ms", 500)}
 
 
 def develop(task: Path, state: dict, config: dict, response: dict) -> dict:
-    state.pop("error", None)
-    revision_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
-    revision_dir = task / "revisions" / revision_id
-    revision_dir.mkdir(parents=True)
-    state["revision_id"] = revision_id
-    frozen_spec = state.get("spec") if state.get("plan") else None
-    for attempt in range(config["max_repairs"] + 1):
-        for key in ("simulation_hash", "build_hash", "artifact", "acceptance"):
-            state.pop(key, None)
-        tools.write_json(revision_dir / f"candidate-{attempt}.json", response)
+    try:
+        return _develop(task, state, config, response)
+    except model_steps.ModelPaused as exc:
+        state.update(status='model_paused', model_pause=exc.details, error=exc.details['reason'])
+        save(task, state)
+        return state
+    except BaseException as exc:
+        state.update(status='interrupted' if isinstance(exc, KeyboardInterrupt) else 'error', error=str(exc))
+        save(task, state)
+        raise
+
+
+def _develop(task, state, config, response):
+    state.pop('error', None)
+    pending = state.get('verification_checkpoint')
+    revision_id = pending['revision_id'] if pending else datetime.now().strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:4]
+    revision_dir = task / 'revisions' / revision_id
+    revision_dir.mkdir(parents=True, exist_ok=True)
+    state['revision_id'] = revision_id
+    frozen_spec = state.get('spec') if state.get('plan') else None
+    first = pending['attempt'] if pending else 0
+    limit = pending.get('max_repairs', config['max_repairs']) if pending else config['max_repairs']
+    for attempt in range(first, limit + 1):
+        candidate = revision_dir / f'candidate-{attempt}.json'
+        failure_stage = 'project_validation'
         try:
+            if pending:
+                if tools.design_hash(task / 'project') != pending['design_hash']:
+                    raise RuntimeError('源码已变化，不能复用暂停前的验证证据；请重新verify。')
+                config = runtime_config(task, config, state)
             spec, design = validate_design(response, config)
             if frozen_spec is not None and spec != frozen_spec:
-                raise ValueError("自动修复不能改变冻结的用户规格。")
+                raise ValueError('自动修复不能改变冻结的用户规格。')
             frozen_spec = spec
-            state.update(spec=spec, message=response.get("message", ""), status="design_ready",
-                         project_format=2, target=config.get("target", "build"))
-            runtime = prepare_project(task, config, spec, design)
-            revision = tools.design_hash(task / "project")
-            task_memory.event(task, "工程", f"版本 {revision_id}，候选 {attempt}；源码已保存至 project/")
-            state["status"] = "simulating"
-            save(task, state)
-            result = tools.run_simulation(runtime)
-            state["results"].append(result)
-            simulation_result = result
-            build_result = None
-            analysis_result = None
-            if result["passed"] and config.get("visualization"):
-                state["status"] = "analyzing"
-                save(task, state)
-                task_memory.event(task, "Python", "根据本次真实仿真VCD生成波形图片和信号摘要")
-                result = python_tool.run(runtime)
-                state["results"].append(result)
-                analysis_result = result
-            if result["passed"] and config.get("target") != "sim":
-                state["status"] = "building"
-                save(task, state)
-                result = tools.run_build(runtime)
-                state["results"].append(result)
-                build_result = result
-            if result["passed"]:
-                state["status"] = "reviewing"
-                save(task, state)
-                review_request = json.dumps(task_memory.context(task), ensure_ascii=False) if state.get("plan") else state["request"]
-                review = review_project(review_request, spec, design, config, task / "llm_calls.jsonl", simulation_result, build_result, analysis_result)
-                review_dir = task / "runs" / f"review-{revision_id}-{attempt}"
-                review_dir.mkdir(parents=True, exist_ok=True)
-                tools.write_json(review_dir / "review.json", review)
-                result = {"stage": "review", "passed": review.get("approved") is True,
-                          "phase": "simulation_review" if config.get("target") == "sim" else "pre_program_review",
-                          "blocking_findings": review.get("blocking_findings", []),
-                          "warnings": review.get("warnings", []),
-                          "pending_checks": review.get("pending_checks", []),
-                          "run_dir": str(review_dir), "diagnostic": json.dumps(review, ensure_ascii=False)}
-                state["results"].append(result)
-                if result["passed"]:
-                    if tools.design_hash(task / "project") != revision:
-                        raise RuntimeError("验证过程中源码已被外部修改，已停止并保留现场文件。")
-                    state["simulation_hash"] = revision
-                    if config.get("target") == "sim":
-                        state["status"] = "simulation_verified"
+            if pending:
+                revision = pending['design_hash']
+                indices = pending['results']
+                runtime = runtime_config(task, config, state)
+            else:
+                for key in ('simulation_hash', 'build_hash', 'artifact', 'acceptance', 'model_pause'):
+                    state.pop(key, None)
+                tools.write_json(candidate, response)
+                state.update(spec=spec, message=response.get('message', ''), status='design_ready',
+                             project_format=2, target=config.get('target', 'build'))
+                runtime = prepare_project(task, config, spec, design)
+                revision = tools.design_hash(task / 'project')
+                task_memory.event(task, '工程', f'版本 {revision_id}，候选 {attempt}；源码已保存至 project/')
+                indices = {}
+                stages = [('simulation', tools.run_simulation)]
+                if config.get('visualization'):
+                    stages.append(('python', python_tool.run))
+                if config.get('target') != 'sim':
+                    stages.append(('build', tools.run_build))
+                for stage, execute in stages:
+                    failure_stage = stage
+                    state['status'] = {'simulation': 'simulating', 'python': 'analyzing', 'build': 'building'}[stage]
+                    save(task, state)
+                    result = execute(runtime)
+                    indices[stage] = len(state['results'])
+                    state['results'].append(result)
+                    if not result['passed']:
+                        break
+            checkpoint = {'revision_id': revision_id, 'attempt': attempt,
+                          'candidate': candidate.relative_to(task).as_posix(), 'design_hash': revision,
+                          'max_repairs': limit, 'results': indices}
+            if pending and pending['phase'] == 'repair':
+                result = state['results'][pending['failed_index']]
+            else:
+                result = state['results'][list(indices.values())[-1]]
+                if result['passed']:
+                    failure_stage = 'review'
+                    state.update(status='reviewing', verification_checkpoint={**checkpoint, 'phase': 'review'})
+                    save(task, state)
+                    plan = state.get('plan', {})
+                    request = json.dumps({'request': state['request'], 'design': plan.get('design'),
+                                          'test_plan': plan.get('test_plan')}, ensure_ascii=False)
+                    previous = next((r for r in reversed(state['results']) if r['stage'] == 'review'), None)
+                    previous = {k: previous.get(k) for k in ('passed', 'blocking_findings', 'run_dir')} if previous else None
+                    source_hash = python_tool.files_hash(design.get('files', {}))
+                    executions = [r for r in state['results'] if r.get('stage') == 'analysis'
+                                  and r.get('source_files_sha256') == source_hash]
+                    review = review_project(request, spec, design, config, task / 'llm_calls.jsonl',
+                                            *[state['results'][indices[k]] if k in indices else None
+                                              for k in ('simulation', 'build', 'python')], previous_review=previous,
+                                            user_reply=state.pop('development_reply', None),
+                                            additional_executions=executions)
+                    if review.get('action') == 'clarify':
+                        state.update(status='waiting_for_user', question=review.get('message', '请补充审查信息'))
                         save(task, state)
                         return state
-                    state.update(build_hash=revision, artifact=build_result["artifact"], status="ready_to_program")
-                    save(task, state)
-                    return state
+                    review_dir = task / 'runs' / f'review-{revision_id}-{attempt}'
+                    review_dir.mkdir(parents=True, exist_ok=True)
+                    tools.write_json(review_dir / 'review.json', review)
+                    result = {'stage': 'review', 'passed': review.get('approved') is True,
+                              'phase': 'simulation_review' if config.get('target') == 'sim' else 'pre_program_review',
+                              **{k: review.get(k, []) for k in ('blocking_findings', 'warnings', 'pending_checks')},
+                              'run_dir': str(review_dir), 'diagnostic': json.dumps(review, ensure_ascii=False)}
+                    state['results'].append(result)
+                    if result['passed']:
+                        if tools.design_hash(task / 'project') != revision:
+                            raise RuntimeError('验证过程中源码已被外部修改，已停止并保留现场文件。')
+                        state.update(simulation_hash=revision, status='simulation_verified')
+                        if config.get('target') != 'sim':
+                            state.update(build_hash=revision, artifact=state['results'][indices['build']]['artifact'], status='ready_to_program')
+                        state.pop('verification_checkpoint', None)
+                        state.pop('model_pause', None)
+                        save(task, state)
+                        return state
         except ValueError as exc:
-            result = {"stage": "project_validation", "passed": False, "diagnostic": str(exc),
-                      "run_dir": str(revision_dir / f"candidate-{attempt}.json")}
-            state["results"].append(result)
-        state["status"] = "verification_failed"
-        state["error"] = result.get("diagnostic", "工程检查失败。")
+            result = {'stage': failure_stage, 'passed': False, 'error_type': type(exc).__name__,
+                      'diagnostic': str(exc), 'run_dir': str(candidate)}
+            state['results'].append(result)
+            # Invalid project metadata has no reusable tool evidence.
+            checkpoint = {'revision_id': revision_id, 'attempt': attempt, 'candidate': candidate.relative_to(task).as_posix(),
+                          'design_hash': tools.design_hash(task / 'project'), 'results': {}, 'max_repairs': limit}
+            if not candidate.exists():
+                tools.write_json(candidate, response)
+        state.update(status='verification_failed', error=result.get('diagnostic', '工程检查失败。'))
         save(task, state)
-        if attempt >= config["max_repairs"]:
-            return state
-        print(f"[修复] 工程/测试/工具失败，DeepSeek分析 {attempt+1}/{config['max_repairs']}", flush=True)
-        state["status"] = "repairing"
-        save(task, state)
-        task_memory.event(task, "修复", str(result.get("errors") or result.get("blocking_findings") or result.get("diagnostic", ""))[:1600])
-        if config.get("incremental"):
-            from .development import repair
-            response = repair(task, state, config, response, result)
-        else:
-            response = analyze_result(result, config, response.get("project", {}),
-                                      frozen_spec or response.get("spec", {}), task / "llm_calls.jsonl")
-        if response.get("action") != "design":
-            state["error"] = response.get("message", "模型未提供修复。")
-            if response.get("action") == "clarify":
-                state.update(status="waiting_for_user", question=state["error"])
-                state["conversation"].append({"role": "assistant", "content": json.dumps(response, ensure_ascii=False)})
-            elif response.get("action") == "pause":
-                state.update(status="development_paused", question=None)
+        if attempt >= limit:
+            state.pop('verification_checkpoint', None)
             save(task, state)
             return state
-        state.pop("error", None)
+        state.update(status='repairing', verification_checkpoint={**checkpoint, 'phase': 'repair', 'failed_index': len(state['results']) - 1})
+        save(task, state)
+        task_memory.event(task, '修复', str(result.get('errors') or result.get('blocking_findings') or result.get('diagnostic', ''))[:1600])
+        if config.get('incremental'):
+            from .development import repair
+            update = repair(task, state, config, response, result)
+        else:
+            update = analyze_result(result, config, response.get('project', {}), frozen_spec or response.get('spec', {}), task / 'llm_calls.jsonl')
+        if update.get('action') != 'design':
+            state['error'] = update.get('message', '模型未提供修复。')
+            if update.get('action') == 'clarify':
+                state.update(status='waiting_for_user', question=state['error'])
+            elif update.get('action') == 'pause':
+                state.update(status='model_paused', question=None, model_pause=update.get('model_pause', {}))
+            save(task, state)
+            return state
+        unchanged = update.get('project') == response.get('project') and update.get('spec') == response.get('spec')
+        response, pending = update, None
+        if unchanged and result['stage'] == 'review' and checkpoint['results']:
+            # Only the review evidence changed: preserve the verified source and tool runs.
+            next_candidate = revision_dir / f'candidate-{attempt + 1}.json'
+            tools.write_json(next_candidate, response)
+            pending = {**checkpoint, 'attempt': attempt + 1, 'phase': 'review',
+                       'candidate': next_candidate.relative_to(task).as_posix()}
+            state['verification_checkpoint'] = pending
+        else:
+            state.pop('verification_checkpoint', None)
+        state.pop('model_pause', None)
+        state.pop('error', None)
+        save(task, state)
     return state
 
 
-def verify_task(task_id: str, config: dict, candidate: str | None = None) -> dict:
+def verify_task(task_id: str, config: dict, candidate: str | None = None, continue_existing=False) -> dict:
     """Re-validate current generated/manual source files without asking the LLM to regenerate them."""
     task = task_path(config, task_id)
     with tools.lock(task / "active.lock"):
         state = json.loads((task / "state.json").read_text(encoding="utf-8"))
+        config = {**config, 'board': state.get('board_id', config['board'])}
+        if continue_existing:
+            pending = state.get('verification_checkpoint')
+            if candidate or not pending:
+                raise ValueError('verify --continue需要现有阶段检查点，不能同时选择新candidate。')
+            response = json.loads((task / pending['candidate']).read_text(encoding='utf-8'))
+            runtime = {**config, 'target': state.get('target', 'build'), 'max_repairs': pending.get('max_repairs', 0),
+                       'visualization': state.get('plan', {}).get('visualization', False), 'incremental': bool(state.get('plan'))}
+            return develop(task, state, runtime, response)
+        state.pop('verification_checkpoint', None)
+        state.pop('model_pause', None)
         if candidate:
             snapshot = (task / candidate).resolve()
             if not snapshot.is_relative_to(task.resolve()) or not snapshot.is_file():
@@ -222,12 +295,7 @@ def verify_task(task_id: str, config: dict, candidate: str | None = None) -> dic
                 raise ValueError("候选工程规格与当前任务不一致，请通过run --resume修改需求。")
             runtime = {**config, "target": state.get("target", "build"), "max_repairs": 0,
                        "visualization": state.get("plan", {}).get("visualization", False)}
-            try:
-                return develop(task, state, runtime, response)
-            except BaseException as exc:
-                state.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "error", error=str(exc))
-                save(task, state)
-                raise
+            return develop(task, state, runtime, response)
         path = task / "project/project.json"
         if not path.is_file():
             raise ValueError("该任务没有通用工程，不能verify。")
@@ -245,13 +313,8 @@ def verify_task(task_id: str, config: dict, candidate: str | None = None) -> dic
         design["files"] = files
         runtime = {**config, "target": design.get("target", "build"), "max_repairs": 0,
                    "visualization": state.get("plan", {}).get("visualization", False)}
-        try:
-            return develop(task, state, runtime, {"action": "design", "message": state.get("message", ""),
-                                                 "spec": state["spec"], "project": design})
-        except BaseException as exc:
-            state.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "error", error=str(exc))
-            save(task, state)
-            raise
+        return develop(task, state, runtime, {"action": "design", "message": state.get("message", ""),
+                                             "spec": state["spec"], "project": design})
 
 
 def run_task(request: str, config: dict, ask=input, task_id: str | None = None) -> dict:
@@ -343,14 +406,8 @@ def deploy(task_id: str, config: dict) -> dict:
                 state["results"].append(result)
             state["status"] = "awaiting_acceptance" if result["passed"] else "hardware_failed"
             if not result["passed"]:
-                state["error"] = f"{result['stage']} 失败，详见 {result['run_dir']}"
-                try:
-                    diagnosis = explain_failure(result, config, task / "llm_calls.jsonl")
-                    tools.write_json(task / "hardware_diagnosis.json", diagnosis)
-                    state["error"] = diagnosis.get("message", state["error"])
-                    print("[诊断] " + state["error"], flush=True)
-                except (RuntimeError, ValueError, OSError, KeyError) as exc:
-                    state["diagnosis_error"] = str(exc)
+                state["error"] = result.get("diagnostic") or result.get("error") or f"{result['stage']} failed; logs: {result['run_dir']}"
+                task_memory.event(task, "执行失败（原始输出摘录）", state["error"][-1600:])
             save(task, state)
             return state
         except BaseException as exc:
@@ -370,9 +427,7 @@ def diagnose(task_id: str, config: dict) -> dict:
             raise ValueError("当前任务没有失败记录。")
         diagnosis = explain_failure(failed, config, task / "llm_calls.jsonl")
         tools.write_json(task / "failure_diagnosis.json", diagnosis)
-        state["error"] = diagnosis.get("message", "模型未返回诊断说明。")
-        save(task, state)
-        print("[诊断] " + state["error"], flush=True)
+        print("[模型诊断，非原始报错] " + diagnosis.get("message", "模型未返回诊断说明。"), flush=True)
         return state
 
 

@@ -191,7 +191,7 @@ def describe(board=None):
                 "hardware_analysis": "optional {script:scripts/*.py,outputs:[artifact filenames]}; --input real VIO CSV --output artifact directory"},
             "hardware_analysis_requires": ["program=true", "debug configured", "successful current programming and sampling"],
             "vio_sampling_limits": {k: {"default": d, "min": lo, "max": hi} for k, d, lo, hi in SAMPLE_LIMITS},
-            "hardware_csv": "elapsed_ms decimal timestamp; each probe column contains hexadecimal values",
+            "hardware_csv": "CSV header: elapsed_ms, followed by debug.probes names in declared order; elapsed_ms is decimal; probe columns contain hexadecimal values, not necessarily prefixed with 0x",
             "jtag_device_family": "xczu15* (current probe/program scripts); other profiles can prepare/simulate/build, but not auto-program",
             "unsupported": ["model-generated XDC/Tcl or arbitrary shell commands", "automatic physical LED light verification"]}
 

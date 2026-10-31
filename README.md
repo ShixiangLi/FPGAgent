@@ -4,7 +4,11 @@
 
 当前使用顺序增量开发：先拆分小任务，任务内通过检查点和片段修改分轮构建工作草稿，最终交付1至3个文件后继续下一项；集成失败时只修改相关文件。支持仿真前Python生成系数等数据。详见[增量开发与恢复](docs/incremental-development.md)。
 
+需求、规划和审查支持分轮保存草案；模型超限后保存为 `model_paused`，可继续原阶段。审查续接复用源码未变时的工具证据。支持用户显式设置 `--max-tokens` 和 `--effort`，配置不会自动变化，见[模型生成与阶段续接](docs/generation-recovery.md)。
+
 系统提示词及通用模型指令集中维护在 [`fpga_agent/prompts/catalog.py`](fpga_agent/prompts/catalog.py)，职责与维护方式见[提示词说明](fpga_agent/prompts/README.md)。核心模块保留流程和动态数据组装。
+
+已有 CSV/VCD 的分析问题可使用 `main.py analyze`：由 DeepSeek 自行读取、修复指定分析脚本、执行并判断结果，支持提问与恢复；不修改原 RTL 或重新下载。见[模型驱动分析与实际验证记录](docs/model-directed-analysis.md)。
 
 方案在用户确认前按[统一执行接口](docs/execution-contract.md)检查并反馈模型修正；规划和工程组装共享规则。已接通VIO采样后的Python分析阶段，可声明实际采样时长、分析脚本和必需报告产物。
 

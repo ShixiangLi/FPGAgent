@@ -1,17 +1,16 @@
 """Bounded research loop; install a cited board profile only after explicit review."""
 import json
-from pathlib import Path
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 
-from .agent import DeepSeekClient
+from . import model_steps, research, tools
+from . import task_memory as memory
 from .confirmation import confirm
 from .documents import Documents
 from .interaction import read_reply
 from .prompts.catalog import BOARD_RESEARCH
-from . import task_memory as memory, tools
-from . import research
 
 
 def validate_candidate(candidate, board_id, documents):
@@ -91,12 +90,14 @@ def run(config, board_id, request, sources=(), ask=None, resume=None):
                 if candidate is None:
                     state["status"] = "researching_board"
                     save(task, state)
-                    response = DeepSeekClient(config).complete([
-                        {"role": "system", "content": BOARD_RESEARCH},
-                        {"role": "user", "content": json.dumps({"board_id": board_id, "goal": state["request"],
-                         "sources": documents.inventory(), "notes": state.get("research_notes", ""),
-                         "recent_tool_results": state["research_log"][-6:]}, ensure_ascii=False)}],
-                        task / "llm_calls.jsonl")
+                    response = model_steps.run(task, config, 'board_research',
+                        {'request': state['request'], 'step': len(state['research_log']), 'notes': state.get('research_notes', '')},
+                        BOARD_RESEARCH, {'board_id': board_id, 'goal': state['request'],
+                         'sources': documents.inventory(), 'notes': state.get('research_notes', ''),
+                         'recent_tool_results': [model_steps.excerpt(json.dumps(r, ensure_ascii=False), 2000)
+                                                 for r in state['research_log'][-4:]]},
+                        files={'research_log.json': json.dumps(state['research_log'], ensure_ascii=False)})
+                    state.pop('model_pause', None)
                     action = response.get("action")
                     if isinstance(response.get("notes"), str):
                         state["research_notes"] = response["notes"][:16000]
@@ -148,6 +149,10 @@ def run(config, board_id, request, sources=(), ask=None, resume=None):
                 save(task, state)
                 return state
             state.update(status="research_paused", error="Research step limit reached; sources and evidence preserved")
+            save(task, state)
+            return state
+        except model_steps.ModelPaused as exc:
+            state.update(status='model_paused', model_pause=exc.details, error=exc.details['reason'])
             save(task, state)
             return state
         except BaseException as exc:

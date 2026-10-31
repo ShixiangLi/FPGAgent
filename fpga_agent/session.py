@@ -4,33 +4,71 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .agent import DeepSeekClient, project_context
-from . import workflow, tools, task_memory as memory
-from .development import build_project
+from . import contract, model_steps, tools, workflow
+from . import task_memory as memory
+from .agent import project_context
 from .confirmation import confirm, digest
+from .development import build_project
 from .interaction import read_reply
-from . import contract
 from .project import board_profile
-
-from .prompts.catalog import ANALYST, PLANNER, PLAN_CONTRACT, PLAN_REPAIR, RESEARCH_ACCESS
+from .prompts.catalog import (
+    ANALYST,
+    PLAN_CONTRACT,
+    PLAN_REPAIR,
+    PLANNER,
+    RESEARCH_ACCESS,
+)
 
 
 def _model(task, state, config, request, system, confirmed=None, proposed=None, errors=None):
-    from .research import READ_ACTIONS, tool_context, read_tool
-    payload = {"current_documents": memory.context(task), "latest_user_input": request,
+    from .research import READ_ACTIONS, read_tool, tool_context
+    request = request or state.get('latest_user_input', state['request'])
+    plan = state.get('plan') or {}
+    payload = {"current_documents": {'requirements': state.get('requirements_analysis'),
+                                    'design': plan.get('design'), 'test_plan': plan.get('test_plan'),
+                                    'project': plan.get('project')}, "latest_user_input": request,
                "confirmed_requirements": confirmed, "execution_contract": contract.describe(board_profile(config)),
                "proposed_plan": proposed, "validation_errors": errors,
                "defaults": {"target": config.get("target"), "program": config.get("program_default", False)}}
-    for turn in range(8):
-        payload["research"] = tool_context(task, config)
-        payload["last_research_round"] = turn == 7
-        response = DeepSeekClient(config).complete([
-            {"role": "system", "content": system + PLAN_CONTRACT + RESEARCH_ACCESS + project_context(config)},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], task / "llm_calls.jsonl")
-        if response.get("action") not in READ_ACTIONS:
-            return response
+    payload['research'] = tool_context(task, config)
+
+    def handle(response):
+        if response.get('action') not in READ_ACTIONS:
+            return False
         read_tool(task, config, response)
-    return {"action": "clarify", "message": "本轮资料查询达到上限，证据已保存。请补充资料或确认继续查询。"}
+        return {'research': tool_context(task, config)}
+
+    def validate(response):
+        if confirmed is not None:
+            errors = contract.plan_issues(response, confirmed, board_profile(config))
+            state['plan_contract_errors'] = errors
+            folder = task / 'planning'
+            folder.mkdir(exist_ok=True)
+            tools.write_json(folder / (uuid.uuid4().hex + '.json'), {'plan': response, 'errors': errors})
+            if errors:
+                memory.event(task, '计划接口反馈', json.dumps(errors, ensure_ascii=False))
+            return errors
+        try:
+            if response.get('action') != 'requirements':
+                return ['Return a requirements result or clarify']
+            contract.validate_requirements(response)
+            return []
+        except ValueError as exc:
+            return [str(exc)]
+
+    stage = 'planning' if confirmed is not None else 'requirements'
+    state['model_phase'] = stage
+    workflow.save(task, state)
+    files = {p.name: p for p in task.glob('*.md')}
+    result = model_steps.run(task, config, stage,
+                           {'request': state['request'], 'input': request, 'confirmed': confirmed,
+                            'proposed': proposed, 'errors': errors},
+                           system + PLAN_CONTRACT + RESEARCH_ACCESS + project_context(config), payload,
+                           files=files, validate=validate, handle_action=handle)
+    if state.get('model_pause', {}).get('stage') == stage:
+        state.pop('model_pause', None)
+    state.pop('model_phase', None)
+    return result
 
 
 def _answer(task, state, ask):
@@ -40,28 +78,45 @@ def _answer(task, state, ask):
     return read_reply(task, ask, "请回答")
 
 
+def _development_question(state):
+    current = state.get("current_work_item")
+    # Older checkpoints predate the explicit question origin.
+    return bool(state.get('verification_checkpoint') or state.get("development_question") or (
+        current and state.get("work_items", {}).get(current, {}).get("status") == "paused"))
+
+
+def _answer_development(task, state, ask):
+    question = state["question"]
+    reply = _answer(task, state, ask)
+    if not reply:
+        return False
+    state.update(development_reply={"question": question, "answer": reply}, question=None, status="developing")
+    with (task / "conversation.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"role": "user", "stage": "development", "work_item": state.get("current_work_item"),
+                            "content": reply}, ensure_ascii=False) + "\n")
+    workflow.save(task, state)
+    return True
+
+
+def _build_with_questions(task, state, config, ask):
+    while True:
+        response = build_project(task, state, config)
+        if response is not None or state["status"] != "waiting_for_user":
+            return response
+        if not _answer_development(task, state, ask):
+            return None
+
+
 def _executable_plan(task, state, config, request, analysis, plan):
-    """Repair interface errors before asking the user to approve a plan."""
-    attempts = task / "planning"
-    attempts.mkdir(exist_ok=True)
+    """Validate old plans; new drafts are checked by the resumable model loop."""
     tools.write_json(task / "execution_contract.json", contract.describe(board_profile(config)))
-    for attempt in range(config.get("max_plan_repairs", 3) + 1):
-        if plan is None:
-            plan = _model(task, state, config, request, PLANNER, analysis)
-        if plan.get("action") == "clarify":
-            return plan
-        errors = contract.plan_issues(plan, analysis, board_profile(config))
-        tools.write_json(attempts / (uuid.uuid4().hex + ".json"), {"plan": plan, "errors": errors})
-        state["plan_contract_errors"] = errors
-        if not errors:
-            tools.write_json(task / "plan_response.json", plan)
-            return plan
-        state["status"] = "repairing_plan"
-        workflow.save(task, state)
-        memory.event(task, "计划接口反馈", json.dumps(errors, ensure_ascii=False, indent=2))
-        if attempt == config.get("max_plan_repairs", 3):
-            raise ValueError("Plan contract repair limit: " + json.dumps(errors, ensure_ascii=False))
-        plan = _model(task, state, config, request, PLANNER + PLAN_REPAIR, analysis, plan, errors)
+    errors = contract.plan_issues(plan, analysis, board_profile(config)) if plan else []
+    state['plan_contract_errors'] = errors
+    if plan is None or errors:
+        plan = _model(task, state, config, request, PLANNER + (PLAN_REPAIR if errors else ''), analysis, plan, errors or None)
+    if plan.get('action') != 'clarify':
+        tools.write_json(task / 'plan_response.json', plan)
+    return plan
 
 
 def run(request, config, ask=None, task_id=None, continue_existing=False, sources=()):
@@ -82,21 +137,34 @@ def run(request, config, ask=None, task_id=None, continue_existing=False, source
     resuming_question = continue_existing and state["status"] == "waiting_for_user"
     analysis = state.get("requirements_analysis") if continue_existing else None
     plan = state.get("plan") if continue_existing else None
+    if continue_existing and (state.get('model_pause', {}).get('stage') == 'requirements' or state.get('model_phase') == 'requirements'):
+        analysis, plan = None, None
     # Existing incremental tasks retain their draft, but now require explicit confirmation.
     if analysis is None and plan is not None:
         analysis = {k: plan[k] for k in ("spec", "target", "program", "visualization")}
-    if continue_existing and analysis is None and not resuming_question:
+    if continue_existing and analysis is None and not resuming_question and not state.get('model_pause') and not state.get('model_phase'):
         raise ValueError("No saved requirements; resume with --request to plan again.")
     with tools.lock(task / "active.lock"):
         try:
             state["research_sources"] = list(dict.fromkeys(state.get("research_sources", []) + [str(s) for s in sources]))
             if resuming_question:
-                request = _answer(task, state, ask)
-                if not request:
-                    return state
-                analysis, plan, continue_existing = None, None, False
+                if _development_question(state):
+                    if not _answer_development(task, state, ask):
+                        return state
+                    request = ""
+                else:
+                    request = _answer(task, state, ask)
+                    if not request:
+                        return state
+                    analysis, plan, continue_existing = None, None, False
             if task_id and request:
                 state["request"] += "\nUser update: " + request
+                state.pop("development_question", None)
+                state.pop("development_reply", None)
+                state["current_work_item"] = None
+                state.pop('model_pause', None)
+                state.pop('verification_checkpoint', None)
+                state.pop('model_phase', None)
             state.pop("error", None)
             for key in ("simulation_hash", "build_hash", "artifact", "acceptance"):
                 state.pop(key, None)
@@ -166,13 +234,10 @@ def run(request, config, ask=None, task_id=None, continue_existing=False, source
                 workflow.save(task, state)
                 runtime = {**config, "target": plan["target"], "task_memory_path": str(task),
                            "visualization": plan["visualization"], "incremental": True}
-                response = build_project(task, state, runtime)
+                pending = state.get('verification_checkpoint')
+                response = (json.loads((task / pending['candidate']).read_text(encoding='utf-8')) if pending
+                            else _build_with_questions(task, state, runtime, ask))
                 if response is None:
-                    if state["status"] == "waiting_for_user":
-                        request = _answer(task, state, ask)
-                        if request:
-                            analysis, plan = None, None
-                            continue
                     return state
                 tools.write_json(task / "design_response.json", response)
                 state = workflow.develop(task, state, runtime, response)
@@ -181,11 +246,22 @@ def run(request, config, ask=None, task_id=None, continue_existing=False, source
                         entry["validation"] = "integrated simulation and review passed"
                     workflow.save(task, state)
                 if state["status"] == "waiting_for_user":
-                    request = _answer(task, state, ask)
-                    if request:
-                        analysis, plan = None, None
-                        continue
+                    if state.get('verification_checkpoint'):
+                        if _answer_development(task, state, ask):
+                            request = ''
+                            continue
+                    else:
+                        request = _answer(task, state, ask)
+                        if request:
+                            analysis, plan = None, None
+                            continue
                 break
+            if state['status'] != 'model_paused':
+                state.pop('model_pause', None)
+        except model_steps.ModelPaused as exc:
+            state.update(status='model_paused', model_pause=exc.details, error=exc.details['reason'])
+            workflow.save(task, state)
+            return state
         except BaseException as exc:
             state.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "error", error=str(exc))
             workflow.save(task, state)
